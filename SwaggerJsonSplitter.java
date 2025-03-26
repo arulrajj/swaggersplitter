@@ -15,7 +15,7 @@ import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-public class SwaggerSplitter {
+public class SwaggerJsonSplitter {
 
     private static final Logger LOGGER = Logger.getLogger(SwaggerSplitter.class.getName());
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -65,21 +65,15 @@ public class SwaggerSplitter {
         JsonNode serversNode = rootNode.path("servers");
         JsonNode componentsNode = rootNode.path("components");
 
-        // Build complete schema registry and component registry
+        // Build complete schema registry
         Map<String, JsonNode> schemaRegistry = new HashMap<>();
-        ObjectNode componentsRegistry = MAPPER.createObjectNode();
-        if (!componentsNode.isMissingNode()) {
-            componentsNode.fields().forEachRemaining(componentEntry -> {
-                componentsRegistry.set(componentEntry.getKey(), componentEntry.getValue());
-                if (componentEntry.getKey().equals("schemas")) {
-                    componentEntry.getValue().fields().forEachRemaining(schemaEntry -> {
-                        schemaRegistry.put(schemaEntry.getKey(), schemaEntry.getValue());
-                    });
-                }
+        if (!componentsNode.isMissingNode() && componentsNode.has("schemas")) {
+            componentsNode.path("schemas").fields().forEachRemaining(entry -> {
+                schemaRegistry.put(entry.getKey(), entry.getValue());
             });
         }
 
-        processApiPaths(rootNode.path("paths"), infoNode, serversNode, componentsRegistry, schemaRegistry, outputPath);
+        processApiPaths(rootNode.path("paths"), infoNode, serversNode, componentsNode, schemaRegistry, outputPath);
     }
 
     private static JsonNode readAndValidateSwaggerJson(String inputFile) throws IOException {
@@ -114,7 +108,7 @@ public class SwaggerSplitter {
     }
 
     private static void processApiPaths(JsonNode pathsNode, JsonNode infoNode, JsonNode serversNode,
-                                     ObjectNode componentsRegistry, Map<String, JsonNode> schemaRegistry,
+                                     JsonNode componentsNode, Map<String, JsonNode> schemaRegistry,
                                      Path outputPath) {
         Iterator<Map.Entry<String, JsonNode>> pathEntries = pathsNode.fields();
         int apiCount = 0;
@@ -130,7 +124,7 @@ public class SwaggerSplitter {
                 Set<String> requiredSchemas = findRequiredSchemas(pathNode, schemaRegistry);
 
                 // Create API document with proper components
-                ObjectNode apiDocument = createApiDocument(infoNode, serversNode, componentsRegistry, requiredSchemas, path, pathNode);
+                ObjectNode apiDocument = createApiDocument(infoNode, serversNode, componentsNode, requiredSchemas, path, pathNode);
 
                 // Write to file
                 writeApiDocument(path, apiDocument, outputPath);
@@ -212,7 +206,7 @@ public class SwaggerSplitter {
     }
 
     private static ObjectNode createApiDocument(JsonNode infoNode, JsonNode serversNode, 
-                                              ObjectNode componentsRegistry, Set<String> requiredSchemas,
+                                              JsonNode componentsNode, Set<String> requiredSchemas,
                                               String path, JsonNode pathNode) {
         ObjectNode apiDocument = MAPPER.createObjectNode();
 
@@ -221,7 +215,7 @@ public class SwaggerSplitter {
         if (!serversNode.isMissingNode()) apiDocument.set("servers", serversNode);
 
         // Add filtered components with all required schemas
-        ObjectNode filteredComponents = createFilteredComponents(componentsRegistry, requiredSchemas);
+        ObjectNode filteredComponents = createFilteredComponents(componentsNode, requiredSchemas);
         if (filteredComponents.size() > 0) {
             apiDocument.set("components", filteredComponents);
         }
@@ -234,28 +228,32 @@ public class SwaggerSplitter {
         return apiDocument;
     }
 
-    private static ObjectNode createFilteredComponents(ObjectNode componentsRegistry, Set<String> requiredSchemas) {
+    private static ObjectNode createFilteredComponents(JsonNode componentsNode, Set<String> requiredSchemas) {
         ObjectNode filteredComponents = MAPPER.createObjectNode();
         
-        // Copy all non-schema components as-is
-        componentsRegistry.fields().forEachRemaining(entry -> {
-            if (!entry.getKey().equals("schemas")) {
-                filteredComponents.set(entry.getKey(), entry.getValue());
-            }
-        });
-
-        // Add filtered schemas if any are required
-        if (!requiredSchemas.isEmpty() && componentsRegistry.has("schemas")) {
-            ObjectNode schemasNode = (ObjectNode) componentsRegistry.get("schemas");
-            ObjectNode filteredSchemas = MAPPER.createObjectNode();
-            
-            requiredSchemas.forEach(schemaName -> {
-                if (schemasNode.has(schemaName)) {
-                    filteredSchemas.set(schemaName, schemasNode.get(schemaName));
+        if (!componentsNode.isMissingNode()) {
+            // First copy all non-schema components
+            componentsNode.fields().forEachRemaining(entry -> {
+                if (!entry.getKey().equals("schemas")) {
+                    filteredComponents.set(entry.getKey(), entry.getValue());
                 }
             });
-            
-            filteredComponents.set("schemas", filteredSchemas);
+
+            // Then add filtered schemas if any are required
+            if (!requiredSchemas.isEmpty() && componentsNode.has("schemas")) {
+                ObjectNode filteredSchemas = MAPPER.createObjectNode();
+                JsonNode schemasNode = componentsNode.path("schemas");
+                
+                requiredSchemas.forEach(schemaName -> {
+                    if (schemasNode.has(schemaName)) {
+                        filteredSchemas.set(schemaName, schemasNode.get(schemaName));
+                    }
+                });
+                
+                if (filteredSchemas.size() > 0) {
+                    filteredComponents.set("schemas", filteredSchemas);
+                }
+            }
         }
         
         return filteredComponents;
