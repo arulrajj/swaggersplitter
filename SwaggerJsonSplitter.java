@@ -1,3 +1,4 @@
+package utils;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -15,7 +16,7 @@ import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-public class SwaggerSplitter {
+public class SwaggerJsonSplitter {
 
     private static final Logger LOGGER = Logger.getLogger(SwaggerSplitter.class.getName());
     private static final ObjectMapper MAPPER = new ObjectMapper();
