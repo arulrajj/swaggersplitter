@@ -15,12 +15,13 @@ import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-public class SwaggerJsonSplitter {
+public class SwaggerSplitter {
 
     private static final Logger LOGGER = Logger.getLogger(SwaggerSplitter.class.getName());
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String SCHEMA_REF_PREFIX = "#/components/schemas/";
     private static final int MAX_FILENAME_LENGTH = 100;
+    private static final String APPLICATION_JSON = "application/json";
 
     public static void main(String[] args) {
         configureLogger();
@@ -98,7 +99,6 @@ public class SwaggerJsonSplitter {
                 Files.createDirectories(outputPath);
                 LOGGER.info("Created output directory: " + outputPath);
             }
-            // Verify write permissions
             Path testFile = Files.createTempFile(outputPath, "test", ".tmp");
             Files.delete(testFile);
             return outputPath;
@@ -120,13 +120,8 @@ public class SwaggerJsonSplitter {
             JsonNode pathNode = pathEntry.getValue();
 
             try {
-                // Find all referenced schemas (including nested dependencies)
                 Set<String> requiredSchemas = findRequiredSchemas(pathNode, schemaRegistry);
-
-                // Create API document with proper components
                 ObjectNode apiDocument = createApiDocument(infoNode, serversNode, componentsNode, requiredSchemas, path, pathNode);
-
-                // Write to file
                 writeApiDocument(path, apiDocument, outputPath);
                 apiCount++;
             } catch (Exception e) {
@@ -143,8 +138,37 @@ public class SwaggerJsonSplitter {
         pathNode.fields().forEachRemaining(methodEntry -> {
             JsonNode operationNode = methodEntry.getValue();
             scanNodeForSchemaReferences(operationNode, requiredSchemas, schemaRegistry);
+            
+            // Explicitly handle requestBody and responses
+            if (operationNode.has("requestBody")) {
+                scanContentForSchemaReferences(operationNode.path("requestBody").path("content"), requiredSchemas, schemaRegistry);
+            }
+            if (operationNode.has("responses")) {
+                operationNode.path("responses").forEach(response -> {
+                    scanContentForSchemaReferences(response.path("content"), requiredSchemas, schemaRegistry);
+                });
+            }
         });
         return requiredSchemas;
+    }
+
+    private static void scanContentForSchemaReferences(JsonNode contentNode, Set<String> requiredSchemas, Map<String, JsonNode> schemaRegistry) {
+        if (contentNode.isMissingNode()) return;
+        
+        // Specifically check application/json content
+        if (contentNode.has(APPLICATION_JSON)) {
+            JsonNode jsonContent = contentNode.path(APPLICATION_JSON);
+            if (jsonContent.has("schema")) {
+                scanNodeForSchemaReferences(jsonContent.path("schema"), requiredSchemas, schemaRegistry);
+            }
+        }
+        
+        // Also check other media types if present
+        contentNode.fields().forEachRemaining(mediaType -> {
+            if (mediaType.getValue().has("schema")) {
+                scanNodeForSchemaReferences(mediaType.getValue().path("schema"), requiredSchemas, schemaRegistry);
+            }
+        });
     }
 
     private static void scanNodeForSchemaReferences(JsonNode node, Set<String> requiredSchemas, Map<String, JsonNode> schemaRegistry) {
@@ -154,7 +178,7 @@ public class SwaggerJsonSplitter {
                 handleSchemaReference(node.get("$ref").asText(), requiredSchemas, schemaRegistry);
             }
 
-            // Check all standard fields that might contain schema references
+            // Check schema-related fields
             String[] schemaFields = {"schema", "items", "additionalProperties"};
             for (String field : schemaFields) {
                 if (node.has(field)) {
@@ -176,18 +200,6 @@ public class SwaggerJsonSplitter {
                 node.get("properties").fields().forEachRemaining(prop -> 
                     scanNodeForSchemaReferences(prop.getValue(), requiredSchemas, schemaRegistry));
             }
-
-            // Check request/response content
-            if (node.has("content")) {
-                node.get("content").fields().forEachRemaining(content -> 
-                    scanNodeForSchemaReferences(content.getValue(), requiredSchemas, schemaRegistry));
-            }
-
-            // Check parameters
-            if (node.has("parameters")) {
-                node.get("parameters").forEach(param -> 
-                    scanNodeForSchemaReferences(param, requiredSchemas, schemaRegistry));
-            }
         } else if (node.isArray()) {
             node.forEach(element -> 
                 scanNodeForSchemaReferences(element, requiredSchemas, schemaRegistry));
@@ -199,7 +211,6 @@ public class SwaggerJsonSplitter {
             String schemaName = ref.substring(SCHEMA_REF_PREFIX.length());
             if (!requiredSchemas.contains(schemaName) && schemaRegistry.containsKey(schemaName)) {
                 requiredSchemas.add(schemaName);
-                // Recursively scan the referenced schema for nested references
                 scanNodeForSchemaReferences(schemaRegistry.get(schemaName), requiredSchemas, schemaRegistry);
             }
         }
@@ -210,17 +221,14 @@ public class SwaggerJsonSplitter {
                                               String path, JsonNode pathNode) {
         ObjectNode apiDocument = MAPPER.createObjectNode();
 
-        // Add basic info
         if (!infoNode.isMissingNode()) apiDocument.set("info", infoNode);
         if (!serversNode.isMissingNode()) apiDocument.set("servers", serversNode);
 
-        // Add filtered components with all required schemas
         ObjectNode filteredComponents = createFilteredComponents(componentsNode, requiredSchemas);
         if (filteredComponents.size() > 0) {
             apiDocument.set("components", filteredComponents);
         }
 
-        // Add the single API path
         ObjectNode singlePathNode = MAPPER.createObjectNode();
         singlePathNode.set(path, pathNode);
         apiDocument.set("paths", singlePathNode);
@@ -232,14 +240,14 @@ public class SwaggerJsonSplitter {
         ObjectNode filteredComponents = MAPPER.createObjectNode();
         
         if (!componentsNode.isMissingNode()) {
-            // First copy all non-schema components
+            // Copy all non-schema components
             componentsNode.fields().forEachRemaining(entry -> {
                 if (!entry.getKey().equals("schemas")) {
                     filteredComponents.set(entry.getKey(), entry.getValue());
                 }
             });
 
-            // Then add filtered schemas if any are required
+            // Add filtered schemas
             if (!requiredSchemas.isEmpty() && componentsNode.has("schemas")) {
                 ObjectNode filteredSchemas = MAPPER.createObjectNode();
                 JsonNode schemasNode = componentsNode.path("schemas");
@@ -272,7 +280,6 @@ public class SwaggerJsonSplitter {
     }
 
     private static String generateFilename(String path) {
-        // Generate safe filename from path
         String filename = path.replaceAll("[^a-zA-Z0-9-]", "_")
                             .replaceAll("_+", "_")
                             .replaceAll("^_|_$", "");
@@ -281,7 +288,6 @@ public class SwaggerJsonSplitter {
             filename = "unnamed_api";
         }
         
-        // Truncate if too long while preserving extension
         if (filename.length() > MAX_FILENAME_LENGTH - 5) {
             filename = filename.substring(0, MAX_FILENAME_LENGTH - 5);
         }
