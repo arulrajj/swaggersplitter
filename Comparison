@@ -1,0 +1,66 @@
+import pdfplumber
+import pandas as pd
+from bs4 import BeautifulSoup
+
+def extract_tables(pdf_path):
+    rows = []
+    current_group = None
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.split("\n"):
+                # Detect section headers like "Phone services", "Cloud Voice", etc.
+                if line.strip().lower().endswith("services") or "Charges for" in line:
+                    current_group = line.strip()
+            
+            # Extract actual amount tables
+            for table in page.extract_tables():
+                for row in table:
+                    if len(row) >= 3:
+                        description = row[0]
+                        amount = row[-2]
+                        vat = row[-1]
+
+                        # Skip headers or blank rows
+                        if description and "£" in amount:
+                            amount_clean = amount.replace("£","").replace(",","").strip()
+                            rows.append([current_group, description.strip(), amount_clean, vat.strip()])
+
+    df = pd.DataFrame(rows, columns=["group", "description", "amount", "vat_rate"])
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df["key"] = (df["group"] + "_" + df["description"]).str.lower().str.replace(r"[^a-z0-9]+","_",regex=True)
+    return df.dropna(subset=["amount"])
+
+
+def compare_bill_items(old_pdf, new_pdf, output_html="bill_comparison_report.html"):
+    df_old = extract_tables(old_pdf)
+    df_new = extract_tables(new_pdf)
+
+    result = pd.merge(df_old, df_new, on="key", how="outer", suffixes=("_old", "_new"))
+
+    result["amount_change"] = result["amount_new"] - result["amount_old"]
+
+    # Create HTML with highlight
+    def color_row(row):
+        if pd.isna(row["amount_old"]):
+            return "background-color:#d1ffd1;"  # new item
+        if pd.isna(row["amount_new"]):
+            return "background-color:#ffd1d1;"  # removed
+        if row["amount_change"] != 0:
+            return "background-color:#fff0b3;"  # changed
+        return ""
+
+    result_style = result.style.apply(lambda row: [color_row(row)]*len(row), axis=1)
+
+    html = result_style.to_html()
+
+    with open(output_html, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"✅ Comparison complete → {output_html}")
+
+
+if __name__ == "__main__":
+    # Replace these filenames
+    compare_bill_items("bill_old.pdf", "bill_new.pdf")
