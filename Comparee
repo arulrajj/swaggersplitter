@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+compare_full_structured.py
+
+Usage:
+    python compare_full_structured.py old_bill.pdf new_bill.pdf -o report.html
+
+Requirements:
+    pip install pdfplumber pandas jinja2
+"""
+
+import pdfplumber
+import re
+import sys
+import math
+import html
+import pandas as pd
+from jinja2 import Template
+from collections import defaultdict
+
+AMOUNT_RE = re.compile(r"[-]?\£?\s*[\d,]+(?:\.\d{1,2})?")
+
+# ---- Helpers --------------------------------------------------------------
+def clean_amount_token(tok: str):
+    if tok is None: return None
+    s = tok.replace("£", "").replace(",", "").strip()
+    s = s.replace("(", "-").replace(")", "")
+    try:
+        return float(s)
+    except:
+        return None
+
+def find_amount_in_text(s: str):
+    m = AMOUNT_RE.search(s)
+    return m.group(0) if m else None
+
+def normalize_key(s: str):
+    if s is None: return ""
+    s2 = s.lower()
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    s2 = re.sub(r"[^a-z0-9 ]", "", s2)
+    s2 = s2[:200]  # keep keys reasonably sized
+    return s2
+
+# ---- Layout-based extraction ----------------------------------------------
+def extract_words_with_layout(pdf_path):
+    """Return list of words with their positions across the document."""
+    words = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for pageno, page in enumerate(pdf.pages, start=1):
+            # use extract_words which returns x0,x1,top,bottom,text
+            for w in page.extract_words(use_text_flow=True):
+                words.append({
+                    "page": pageno,
+                    "text": w.get("text", ""),
+                    "x0": float(w.get("x0", 0)),
+                    "x1": float(w.get("x1", 0)),
+                    "top": float(w.get("top", 0)),
+                    "bottom": float(w.get("bottom", 0)),
+                })
+    return words
+
+def cluster_rows(words, y_tol=3.5):
+    """
+    Group words into visual rows by 'top' coordinate.
+    y_tol is vertical tolerance in PDF units (tweak if needed).
+    """
+    rows = []
+    # sort by page then top then x0
+    words_sorted = sorted(words, key=lambda w: (w["page"], w["top"], w["x0"]))
+    for w in words_sorted:
+        placed = False
+        for r in rows:
+            if r["page"] == w["page"] and abs(r["top"] - w["top"]) <= y_tol:
+                r["words"].append(w)
+                # update average top
+                r["top"] = (r["top"] * r["count"] + w["top"]) / (r["count"] + 1)
+                r["count"] += 1
+                placed = True
+                break
+        if not placed:
+            rows.append({"page": w["page"], "top": w["top"], "words":[w], "count":1})
+    # sort words inside rows by x0
+    for r in rows:
+        r["words"] = sorted(r["words"], key=lambda x: x["x0"])
+    return rows
+
+def detect_amount_column(rows):
+    """
+    Heuristic: find the x-position (left edge) that most frequently contains numeric tokens.
+    We'll collect candidate x positions for amount tokens and take a robust median.
+    """
+    amount_x = []
+    for r in rows:
+        for w in r["words"]:
+            if AMOUNT_RE.search(w["text"]):
+                amount_x.append(w["x0"])
+    if not amount_x:
+        return None
+    # robust median
+    amount_x_sorted = sorted(amount_x)
+    mid = len(amount_x_sorted)//2
+    return amount_x_sorted[mid]
+
+def build_row_text(r):
+    """Concatenate words in a row into a single string with spaces."""
+    return " ".join(w["text"] for w in r["words"])
+
+def extract_items_from_rows(rows, amount_x_threshold=None):
+    items = []
+    current_section = None
+    for r in rows:
+        row_text = build_row_text(r).strip()
+        lower = row_text.lower()
+
+        # Heuristic: section headings like "phone services", "broadband", "charges for"
+        if lower.endswith("services") or "charges for" in lower or lower.startswith("totals") or lower.startswith("totals:") or lower.startswith("totals "):
+            current_section = row_text
+            continue
+
+        # If no numeric amount in row, skip (but may hold description continuation)
+        # We'll detect amount by checking words with x position >= amount_x_threshold
+        amount = None
+        description = None
+        vat_token = None
+
+        if amount_x_threshold is None:
+            # fallback: find rightmost numeric token
+            numeric_tokens = [w for w in r["words"] if AMOUNT_RE.search(w["text"])]
+            if numeric_tokens:
+                # choose the rightmost numeric token
+                rightmost = max(numeric_tokens, key=lambda x: x["x0"])
+                amount = rightmost["text"]
+                # description is all words to left of this token
+                desc_words = [w["text"] for w in r["words"] if w["x1"] <= rightmost["x0"] + 1]
+                description = " ".join(desc_words).strip()
+            else:
+                continue
+        else:
+            # split words into left-of-amount and amount area based on x threshold
+            left_words = [w for w in r["words"] if w["x1"] < amount_x_threshold - 2]
+            right_words = [w for w in r["words"] if w["x0"] >= amount_x_threshold - 2]
+            # amount probably in right_words; find numeric token there
+            numeric_tokens = [w for w in right_words if AMOUNT_RE.search(w["text"])]
+            if numeric_tokens:
+                # amount is first numeric token in right area (left-to-right)
+                amount = numeric_tokens[0]["text"]
+                description = " ".join([w["text"] for w in left_words]).strip()
+                # VAT rate may be to the very right of row
+                vat_candidates = [w for w in right_words if re.match(r"\d{1,2}\%$", w["text"].strip())]
+                if vat_candidates:
+                    vat_token = vat_candidates[-1]["text"]
+            else:
+                # fallback to rightmost numeric anywhere
+                numeric_tokens_all = [w for w in r["words"] if AMOUNT_RE.search(w["text"])]
+                if numeric_tokens_all:
+                    amt_w = max(numeric_tokens_all, key=lambda x: x["x0"])
+                    amount = amt_w["text"]
+                    description = " ".join([w["text"] for w in r["words"] if w["x1"] <= amt_w["x0"]+1]).strip()
+                else:
+                    continue
+
+        items.append({
+            "section": current_section,
+            "description": description or row_text,
+            "amount_raw": amount,
+            "amount": clean_amount_token(amount),
+            "vat": vat_token
+        })
+
+    # collapse/merge consecutive items with empty amount (description continuation)
+    merged = []
+    for it in items:
+        if merged and (it["amount"] is None) and (it["section"] == merged[-1]["section"]):
+            # append description to previous
+            merged[-1]["description"] += " " + it["description"]
+        else:
+            merged.append(it)
+    # remove any remaining without amount
+    merged = [m for m in merged if m["amount"] is not None]
+    # create keys
+    for m in merged:
+        m["key"] = normalize_key((m["section"] or "") + " " + m["description"])
+    return merged
+
+# ---- Totals / VAT extraction (text based heuristics) -----------------------
+def extract_totals_textwise(pdf_path):
+    with pdfplumber.open(pdf_path) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    res = {
+        "total_excluding_vat": None,
+        "vat_amount": None,
+        "total_including_vat": None
+    }
+
+    # common patterns - relaxed
+    patterns = [
+        (r"Total excluding VAT[:\s]*£\s*([\d,]+\.\d{1,2})", "total_excluding_vat"),
+        (r"Total excluding VAT[:\s]*([\d,]+\.\d{1,2})", "total_excluding_vat"),
+        (r"VAT at \d{1,2}%[:\s]*£\s*([\d,]+\.\d{1,2})", "vat_amount"),
+        (r"Total VAT[:\s]*£\s*([\d,]+\.\d{1,2})", "vat_amount"),
+        (r"TOTAL which includes total VAT of[:\s]*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
+        (r"Total for this bill[:\s]*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
+        (r"TOTAL[:\s]*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
+        (r"TOTAL\s*=\s*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
+    ]
+
+    for patt, key in patterns:
+        m = re.search(patt, full_text, flags=re.IGNORECASE)
+        if m:
+            try:
+                res[key] = float(m.group(1).replace(",",""))
+            except:
+                pass
+
+    # fallback: find last big monetary value as total
+    if res["total_including_vat"] is None:
+        all_amounts = [float(x.replace("£","").replace(",","")) for x in re.findall(r"£\s*([\d,]+\.\d{1,2})", full_text)]
+        if all_amounts:
+            res["total_including_vat"] = all_amounts[-1]
+    return res
+
+# ---- Comparison & HTML generation -----------------------------------------
+HTML_TMPL = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bill Comparison Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 18px; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+    th { background: #f2f2f2; }
+    .added { background: #e6ffea; }   /* green */
+    .removed { background: #ffe6e6; } /* red */
+    .changed { background: #fff7d6; } /* yellow */
+    .mono { font-family: monospace; white-space: pre-wrap; }
+    caption { text-align:left; font-weight:bold; padding:6px 0; }
+  </style>
+</head>
+<body>
+  <h1>Full PDF Structured Comparison</h1>
+
+  <h2>Totals & VAT Summary</h2>
+  <table>
+    <tr><th>Field</th><th>Old Bill</th><th>New Bill</th><th>Change</th></tr>
+    <tr><td>Total excluding VAT</td><td>{{totals.old.total_excluding_vat}}</td><td>{{totals.new.total_excluding_vat}}</td><td>{{totals.change.total_excluding_vat}}</td></tr>
+    <tr><td>VAT amount</td><td>{{totals.old.vat_amount}}</td><td>{{totals.new.vat_amount}}</td><td>{{totals.change.vat_amount}}</td></tr>
+    <tr><td><b>Total including VAT</b></td><td><b>{{totals.old.total_including_vat}}</b></td><td><b>{{totals.new.total_including_vat}}</b></td><td><b>{{totals.change.total_including_vat}}</b></td></tr>
+  </table>
+
+  <h2>Line Item Comparison</h2>
+  <table>
+    <tr><th style="width:45%">Description (section + description)</th><th style="width:15%">Old Amount</th><th style="width:15%">New Amount</th><th style="width:15%">Change</th></tr>
+    {% for r in rows %}
+      <tr class="{{r.cls}}">
+        <td>{{ r.section }} — {{ r.description }}</td>
+        <td style="text-align:right">{{ r.amount_old }}</td>
+        <td style="text-align:right">{{ r.amount_new }}</td>
+        <td style="text-align:right">{{ r.delta }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Raw extraction preview (old)</h2>
+  <div class="mono">{{ raw_old }}</div>
+
+  <h2>Raw extraction preview (new)</h2>
+  <div class="mono">{{ raw_new }}</div>
+
+</body>
+</html>
+"""
+
+def compare_and_report(old_pdf, new_pdf, out_html="bill_comparison_report.html"):
+    # Extract words & rows
+    words_old = extract_words_with_layout(old_pdf)
+    words_new = extract_words_with_layout(new_pdf)
+    rows_old = cluster_rows(words_old)
+    rows_new = cluster_rows(words_new)
+
+    # detect amount column globally using both bills
+    combined_rows = rows_old + rows_new
+    amount_x = detect_amount_column(combined_rows)
+
+    items_old = extract_items_from_rows(rows_old, amount_x_threshold=amount_x)
+    items_new = extract_items_from_rows(rows_new, amount_x_threshold=amount_x)
+
+    df_old = pd.DataFrame(items_old)
+    df_new = pd.DataFrame(items_new)
+
+    # raw text preview (top 2000 chars)
+    raw_old = "\n".join(build_row_text(r) for r in rows_old)[:20000]
+    raw_new = "\n".join(build_row_text(r) for r in rows_new)[:20000]
+
+    # totals
+    totals_old = extract_totals_textwise(old_pdf)
+    totals_new = extract_totals_textwise(new_pdf)
+    totals_change = {k: None for k in totals_old.keys()}
+    for k in totals_old.keys():
+        a = totals_old.get(k) or 0.0
+        b = totals_new.get(k) or 0.0
+        totals_change[k] = round(b - a, 2)
+
+    # merge items by key to compare
+    merged = pd.merge(df_old, df_new, on="key", how="outer", suffixes=("_old","_new"))
+
+    rows = []
+    for _, r in merged.iterrows():
+        amt_old = r.get("amount_old") if not pd.isna(r.get("amount_old")) else None
+        amt_new = r.get("amount_new") if not pd.isna(r.get("amount_new")) else None
+        desc_old = r.get("description_old") if not pd.isna(r.get("description_old")) else (r.get("description_new") if not pd.isna(r.get("description_new")) else "")
+        sect_old = r.get("section_old") if not pd.isna(r.get("section_old")) else (r.get("section_new") if not pd.isna(r.get("section_new")) else "")
+
+        delta = None
+        if amt_old is None and amt_new is not None:
+            cls = "added"
+            delta = round(amt_new,2)
+        elif amt_new is None and amt_old is not None:
+            cls = "removed"
+            delta = round(-amt_old,2)
+        elif amt_old is not None and amt_new is not None:
+            d = round(amt_new - amt_old, 2)
+            cls = "changed" if d != 0 else ""
+            delta = d
+        else:
+            cls = ""
+            delta = None
+
+        rows.append({
+            "key": r["key"],
+            "section": sect_old or "",
+            "description": desc_old or "",
+            "amount_old": f"£{amt_old:,.2f}" if amt_old is not None else "",
+            "amount_new": f"£{amt_new:,.2f}" if amt_new is not None else "",
+            "delta": (f"£{delta:+.2f}" if delta is not None else ""),
+            "cls": cls
+        })
+
+    tpl = Template(HTML_TMPL)
+    rendered = tpl.render(
+        totals={"old": totals_old, "new": totals_new, "change": totals_change},
+        rows=rows,
+        raw_old=html.escape(raw_old),
+        raw_new=html.escape(raw_new)
+    )
+
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write(rendered)
+    print("Report generated:", out_html)
+
+# ---- CLI ------------------------------------------------------------------
+def main(argv):
+    if len(argv) < 3:
+        print("Usage: python compare_full_structured.py old.pdf new.pdf [-o report.html]")
+        return
+    old_pdf = argv[1]
+    new_pdf = argv[2]
+    out = "bill_comparison_report.html"
+    if "-o" in argv:
+        i = argv.index("-o")
+        if i+1 < len(argv):
+            out = argv[i+1]
+    compare_and_report(old_pdf, new_pdf, out)
+
+if __name__ == "__main__":
+    main(sys.argv)
