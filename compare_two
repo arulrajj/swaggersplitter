@@ -1,0 +1,165 @@
+import re
+from pdfminer.high_level import extract_text
+from collections import defaultdict
+import pandas as pd
+
+# -------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------
+
+def extract_page_texts(pdf_path):
+    """Extracts text from all pages."""
+    text = extract_text(pdf_path)
+    pages = text.split('\f')  # PDF pages separated by form-feed
+    return pages
+
+def get_billing_address_and_account(pages):
+    """Extract billing address and account number from page 1 only."""
+    first_page = pages[0]
+    account_no = None
+    billing_address = None
+
+    # Account number pattern (top right corner, like 'Account number    VP 0024 5678')
+    acc_match = re.search(r'Account\s*number\s*([A-Z]{2}\s*\d{4}\s*\d{4})', first_page)
+    if acc_match:
+        account_no = acc_match.group(1).strip()
+
+    # Billing address block (grab lines under 'Billing address' until blank)
+    bill_match = re.search(r'Billing address\s*(.*?)\n\n', first_page, re.S)
+    if bill_match:
+        billing_address = bill_match.group(1).strip()
+
+    return billing_address, account_no
+
+
+def parse_amount(token):
+    """Return float value if token looks like a currency/charge, else None."""
+    token = token.replace(',', '').strip()
+    if re.match(r'^£?-?\d+(\.\d{1,2})?$', token):
+        # Only accept if looks like a money amount (may have £)
+        val = token.replace('£', '')
+        try:
+            return float(val)
+        except ValueError:
+            return None
+    return None
+
+
+def is_informational_line(line):
+    """Return True if line is informational text (no charge)."""
+    info_phrases = [
+        'these figures exclude', 'your offer ends on',
+        'vat at', 'total vat', 'total for items where vat',
+        'billing address', 'account number'
+    ]
+    lline = line.lower()
+    return any(p in lline for p in info_phrases)
+
+
+def extract_line_items(pdf_path):
+    """Extracts categories, line items and their amounts from the PDF."""
+    pages = extract_page_texts(pdf_path)
+    items = []
+    category = None
+
+    for page in pages:
+        for raw_line in page.split('\n'):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            # Detect category headings
+            if re.search(r'(regular charges|one-off charges|discounts)', line, re.I):
+                category = line.strip()
+                continue
+
+            if is_informational_line(line):
+                continue
+
+            # Split by multiple spaces or tabs
+            parts = re.split(r'\s{2,}', line)
+            if len(parts) == 1:
+                # no obvious separation, skip unless looks like 'Item  £Amount'
+                continue
+
+            # Usually the last token is an amount
+            potential_amount = parts[-1]
+            amount = parse_amount(potential_amount)
+            if amount is None:
+                continue
+
+            item_name = " ".join(parts[:-1]).strip()
+            if not item_name:
+                continue
+
+            items.append({
+                "Category": category,
+                "Item": item_name,
+                "Amount": amount
+            })
+
+    return items, pages
+
+
+def compare_items(items1, items2):
+    """Compare items category-wise between two PDFs."""
+    df1 = pd.DataFrame(items1)
+    df2 = pd.DataFrame(items2)
+
+    key_cols = ["Category", "Item"]
+    merged = pd.merge(df1, df2, on=key_cols, how='outer', suffixes=('_file1', '_file2'))
+
+    results = []
+    for _, row in merged.iterrows():
+        amt1, amt2 = row.get('Amount_file1'), row.get('Amount_file2')
+
+        if pd.isna(amt1) and pd.isna(amt2):
+            result = "N/A"
+        elif pd.isna(amt1):
+            result = "Missing in File1"
+        elif pd.isna(amt2):
+            result = "Missing in File2"
+        elif abs(amt1 - amt2) < 0.01:
+            result = "MATCH"
+        else:
+            result = "DIFF"
+
+        results.append({
+            "Category": row["Category"],
+            "Line Item": row["Item"],
+            "File1 Amount": f"£{amt1:.2f}" if pd.notna(amt1) else "",
+            "File2 Amount": f"£{amt2:.2f}" if pd.notna(amt2) else "",
+            "Comparison Result": result
+        })
+    return pd.DataFrame(results)
+
+
+# -------------------------------------------------------
+# Main
+# -------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare two BT bill PDFs")
+    parser.add_argument("file1", help="Path to first bill PDF")
+    parser.add_argument("file2", help="Path to second bill PDF")
+    parser.add_argument("--out", default="comparison_report.csv", help="Output CSV file")
+    args = parser.parse_args()
+
+    # Extract data from PDFs
+    items1, pages1 = extract_line_items(args.file1)
+    items2, pages2 = extract_line_items(args.file2)
+
+    billing1, acc1 = get_billing_address_and_account(pages1)
+    billing2, acc2 = get_billing_address_and_account(pages2)
+
+    print("File1 Account:", acc1)
+    print("File2 Account:", acc2)
+    print("File1 Billing Address:\n", billing1)
+    print("File2 Billing Address:\n", billing2)
+
+    # Compare
+    report_df = compare_items(items1, items2)
+
+    # Save report
+    report_df.to_csv(args.out, index=False)
+    print(f"\nComparison complete. Report saved to {args.out}")
