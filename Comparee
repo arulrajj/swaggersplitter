@@ -1,369 +1,509 @@
 #!/usr/bin/env python3
 """
-compare_full_structured.py
+bt_bill_compare.py
 
-Usage:
-    python compare_full_structured.py old_bill.pdf new_bill.pdf -o report.html
+Single-file script to:
+ - extract text from PDF (selectable text + OCR)
+ - parse key billing fields (account, address, products, VAT, totals)
+ - compare two bills and highlight differences
+ - create per-file HTML report and an index HTML for batch runs
 
-Requirements:
-    pip install pdfplumber pandas jinja2
+Author: ChatGPT (Telecom automation specialist)
+Date: 2025-11-07
 """
 
-import pdfplumber
+import os
 import re
 import sys
-import math
+import io
+import argparse
 import html
-import pandas as pd
-from jinja2 import Template
-from collections import defaultdict
+import logging
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from collections import defaultdict, namedtuple
 
-AMOUNT_RE = re.compile(r"[-]?\£?\s*[\d,]+(?:\.\d{1,2})?")
+# PDF + image libraries
+try:
+    import fitz  # PyMuPDF
+    from PIL import Image
+    import pytesseract
+    from pdf2image import convert_from_path
+    from jinja2 import Template
+except Exception as e:
+    print("Missing dependencies. Install them: pip install pymupdf pillow pytesseract pdf2image jinja2")
+    print("Also ensure system tesseract and poppler are installed.")
+    raise
 
-# ---- Helpers --------------------------------------------------------------
-def clean_amount_token(tok: str):
-    if tok is None: return None
-    s = tok.replace("£", "").replace(",", "").strip()
-    s = s.replace("(", "-").replace(")", "")
+# ---------------------------
+# Logging
+# ---------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("bt-bill-compare")
+
+# ---------------------------
+# Helpers & normalization
+# ---------------------------
+
+AMOUNT_RE = re.compile(r"£?\s?([0-9\.,]+)\s*(?:GBP|pounds)?", re.I)
+ACCOUNT_RE = re.compile(r"(?:Account(?: number)?|Account No\.?|A/C No\.?)[:\s]*([A-Z0-9\-]{4,})", re.I)
+VAT_RE = re.compile(r"VAT[:\s]*£?\s*([0-9\.,]+)", re.I)
+TOTAL_RE = re.compile(r"Total(?: Due| Amount| Amount Due)?[:\s]*£?\s*([0-9\.,]+)", re.I)
+SUBTOTAL_RE = re.compile(r"(?:Subtotal|Sub Total)[:\s]*£?\s*([0-9\.,]+)", re.I)
+
+# Typical line items may be like "BT Business Broadband monthly charge £30.50"
+LINEITEM_RE = re.compile(r"([A-Za-z0-9 \-/&',\.]{6,100}?)\s{1,}\£\s?([0-9\.,]+)", re.I)
+
+# UK postcode rough pattern (helps locate address block)
+UK_POSTCODE_RE = re.compile(r"[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}", re.I)
+
+# Named tuple for parsed bill
+ParsedBill = namedtuple("ParsedBill", ["file", "account_number", "billing_address",
+                                       "products", "subtotal", "vat", "total", "raw_text"])
+
+def norm_amount(s):
+    """Normalize string amount to Decimal (two decimal places) or None."""
+    if s is None:
+        return None
+    s = s.strip().replace("£", "").replace(",", "")
+    s = re.sub(r"[^\d\.]", "", s)
+    if s == "":
+        return None
     try:
-        return float(s)
-    except:
-        return None
+        return Decimal(s).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        try:
+            return Decimal(float(s)).quantize(Decimal("0.01"))
+        except Exception:
+            return None
 
-def find_amount_in_text(s: str):
-    m = AMOUNT_RE.search(s)
-    return m.group(0) if m else None
+def safe_get(m):
+    return m.group(1).strip() if m else None
 
-def normalize_key(s: str):
-    if s is None: return ""
-    s2 = s.lower()
-    s2 = re.sub(r"\s+", " ", s2).strip()
-    s2 = re.sub(r"[^a-z0-9 ]", "", s2)
-    s2 = s2[:200]  # keep keys reasonably sized
-    return s2
+def collapse_whitespace(s):
+    return re.sub(r"\s+", " ", s).strip() if s else s
 
-# ---- Layout-based extraction ----------------------------------------------
-def extract_words_with_layout(pdf_path):
-    """Return list of words with their positions across the document."""
-    words = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for pageno, page in enumerate(pdf.pages, start=1):
-            # use extract_words which returns x0,x1,top,bottom,text
-            for w in page.extract_words(use_text_flow=True):
-                words.append({
-                    "page": pageno,
-                    "text": w.get("text", ""),
-                    "x0": float(w.get("x0", 0)),
-                    "x1": float(w.get("x1", 0)),
-                    "top": float(w.get("top", 0)),
-                    "bottom": float(w.get("bottom", 0)),
-                })
-    return words
+# ---------------------------
+# PDF text extraction
+# ---------------------------
 
-def cluster_rows(words, y_tol=3.5):
+def extract_text_selectable(pdf_path):
     """
-    Group words into visual rows by 'top' coordinate.
-    y_tol is vertical tolerance in PDF units (tweak if needed).
+    Extract selectable text using PyMuPDF. Also returns images info for optional OCR.
     """
-    rows = []
-    # sort by page then top then x0
-    words_sorted = sorted(words, key=lambda w: (w["page"], w["top"], w["x0"]))
-    for w in words_sorted:
-        placed = False
-        for r in rows:
-            if r["page"] == w["page"] and abs(r["top"] - w["top"]) <= y_tol:
-                r["words"].append(w)
-                # update average top
-                r["top"] = (r["top"] * r["count"] + w["top"]) / (r["count"] + 1)
-                r["count"] += 1
-                placed = True
-                break
-        if not placed:
-            rows.append({"page": w["page"], "top": w["top"], "words":[w], "count":1})
-    # sort words inside rows by x0
-    for r in rows:
-        r["words"] = sorted(r["words"], key=lambda x: x["x0"])
-    return rows
+    txt = []
+    images = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            for pnum, page in enumerate(doc, start=1):
+                # page.get_text("text") keeps textual order (good baseline)
+                page_text = page.get_text("text")
+                if page_text:
+                    txt.append(page_text)
+                # collect embedded images for OCR if needed
+                for img in page.get_images(full=True):
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    images.append((pnum, image_bytes))
+    except Exception as e:
+        logger.exception("Error extracting selectable text from %s: %s", pdf_path, e)
+    return "\n".join(txt), images
 
-def detect_amount_column(rows):
+def extract_text_ocr(pdf_path, dpi=200, first_n_pages=None):
     """
-    Heuristic: find the x-position (left edge) that most frequently contains numeric tokens.
-    We'll collect candidate x positions for amount tokens and take a robust median.
+    Convert pages to images via pdf2image and perform tesseract OCR.
+    Returns string of OCR text.
     """
-    amount_x = []
-    for r in rows:
-        for w in r["words"]:
-            if AMOUNT_RE.search(w["text"]):
-                amount_x.append(w["x0"])
-    if not amount_x:
-        return None
-    # robust median
-    amount_x_sorted = sorted(amount_x)
-    mid = len(amount_x_sorted)//2
-    return amount_x_sorted[mid]
+    logger.debug("Running OCR on %s (dpi=%s)", pdf_path, dpi)
+    text_parts = []
+    try:
+        images = convert_from_path(pdf_path, dpi=dpi)
+        if first_n_pages:
+            images = images[:first_n_pages]
+        for img in images:
+            # convert to RGB to avoid mode issues
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            ocr_text = pytesseract.image_to_string(img)
+            text_parts.append(ocr_text)
+    except Exception as e:
+        logger.exception("OCR failed for %s: %s", pdf_path, e)
+    return "\n".join(text_parts)
 
-def build_row_text(r):
-    """Concatenate words in a row into a single string with spaces."""
-    return " ".join(w["text"] for w in r["words"])
+def extract_pdf_text(pdf_path, use_ocr_fallback=True):
+    """
+    Combined extraction: first selectable text, then (optionally) OCR for images and pages without text.
+    """
+    logger.info("Extracting text from: %s", pdf_path)
+    sel_text, images = extract_text_selectable(pdf_path)
 
-def extract_items_from_rows(rows, amount_x_threshold=None):
+    # If selectable text seems empty or very small, use OCR on all pages
+    if use_ocr_fallback:
+        if len(sel_text.strip()) < 100:
+            logger.info("Selectable text small; using full OCR for %s", pdf_path)
+            ocr = extract_text_ocr(pdf_path)
+            combined = ocr
+        else:
+            # run OCR only on images extracted and append
+            ocr_texts = []
+            if images:
+                logger.debug("Found %d embedded images for OCR in %s", len(images), pdf_path)
+                for pnum, image_bytes in images:
+                    try:
+                        img = Image.open(io.BytesIO(image_bytes))
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        ocr_texts.append(pytesseract.image_to_string(img))
+                    except Exception:
+                        continue
+            combined = sel_text + "\n" + "\n".join(ocr_texts)
+    else:
+        combined = sel_text
+
+    combined = collapse_whitespace(combined)
+    return combined
+
+# ---------------------------
+# Parsing functions
+# ---------------------------
+
+def parse_billing_address_from_text(text):
+    """
+    Heuristic to extract billing address block.
+    We look for lines near keywords like 'Billing Address' or look for postal code patterns.
+    """
+    # 1) Search for 'Billing Address' label
+    m = re.search(r"Billing Address[:\s]*(.*?)(?:Account|Invoice|Invoice Number|Account Number|Total|Amount Due)", text, re.I | re.S)
+    if m:
+        addr = collapse_whitespace(m.group(1))
+        # cut off if it's too long and contains other keywords
+        addr = re.sub(r"(Invoice|Account|Total).*$", "", addr, flags=re.I)
+        return addr.strip()
+
+    # 2) Fallback: find the first occurrence of a UK postcode and take several words before it
+    m2 = UK_POSTCODE_RE.search(text)
+    if m2:
+        idx = m2.start()
+        snippet = text[max(0, idx-300): idx+20]
+        return collapse_whitespace(snippet)
+
+    # 3) Last resort: try to find "Dear <name>" and address above it (rare)
+    return None
+
+def parse_products_from_text(text):
+    """
+    Extract product/line items using regex patterns. Return list of dicts {desc, amount}.
+    """
     items = []
-    current_section = None
-    for r in rows:
-        row_text = build_row_text(r).strip()
-        lower = row_text.lower()
-
-        # Heuristic: section headings like "phone services", "broadband", "charges for"
-        if lower.endswith("services") or "charges for" in lower or lower.startswith("totals") or lower.startswith("totals:") or lower.startswith("totals "):
-            current_section = row_text
-            continue
-
-        # If no numeric amount in row, skip (but may hold description continuation)
-        # We'll detect amount by checking words with x position >= amount_x_threshold
-        amount = None
-        description = None
-        vat_token = None
-
-        if amount_x_threshold is None:
-            # fallback: find rightmost numeric token
-            numeric_tokens = [w for w in r["words"] if AMOUNT_RE.search(w["text"])]
-            if numeric_tokens:
-                # choose the rightmost numeric token
-                rightmost = max(numeric_tokens, key=lambda x: x["x0"])
-                amount = rightmost["text"]
-                # description is all words to left of this token
-                desc_words = [w["text"] for w in r["words"] if w["x1"] <= rightmost["x0"] + 1]
-                description = " ".join(desc_words).strip()
-            else:
-                continue
-        else:
-            # split words into left-of-amount and amount area based on x threshold
-            left_words = [w for w in r["words"] if w["x1"] < amount_x_threshold - 2]
-            right_words = [w for w in r["words"] if w["x0"] >= amount_x_threshold - 2]
-            # amount probably in right_words; find numeric token there
-            numeric_tokens = [w for w in right_words if AMOUNT_RE.search(w["text"])]
-            if numeric_tokens:
-                # amount is first numeric token in right area (left-to-right)
-                amount = numeric_tokens[0]["text"]
-                description = " ".join([w["text"] for w in left_words]).strip()
-                # VAT rate may be to the very right of row
-                vat_candidates = [w for w in right_words if re.match(r"\d{1,2}\%$", w["text"].strip())]
-                if vat_candidates:
-                    vat_token = vat_candidates[-1]["text"]
-            else:
-                # fallback to rightmost numeric anywhere
-                numeric_tokens_all = [w for w in r["words"] if AMOUNT_RE.search(w["text"])]
-                if numeric_tokens_all:
-                    amt_w = max(numeric_tokens_all, key=lambda x: x["x0"])
-                    amount = amt_w["text"]
-                    description = " ".join([w["text"] for w in r["words"] if w["x1"] <= amt_w["x0"]+1]).strip()
-                else:
-                    continue
-
-        items.append({
-            "section": current_section,
-            "description": description or row_text,
-            "amount_raw": amount,
-            "amount": clean_amount_token(amount),
-            "vat": vat_token
-        })
-
-    # collapse/merge consecutive items with empty amount (description continuation)
-    merged = []
+    # find all occurrences of pattern: description ... £amount
+    for m in LINEITEM_RE.finditer(text):
+        desc = m.group(1).strip()
+        amt = norm_amount(m.group(2))
+        if desc and amt is not None:
+            items.append({"desc": collapse_whitespace(desc), "amount": amt})
+    # Deduplicate items by (desc,amount)
+    seen = set()
+    unique = []
     for it in items:
-        if merged and (it["amount"] is None) and (it["section"] == merged[-1]["section"]):
-            # append description to previous
-            merged[-1]["description"] += " " + it["description"]
-        else:
-            merged.append(it)
-    # remove any remaining without amount
-    merged = [m for m in merged if m["amount"] is not None]
-    # create keys
-    for m in merged:
-        m["key"] = normalize_key((m["section"] or "") + " " + m["description"])
-    return merged
+        key = (it["desc"].lower(), str(it["amount"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(it)
+    return unique
 
-# ---- Totals / VAT extraction (text based heuristics) -----------------------
-def extract_totals_textwise(pdf_path):
-    with pdfplumber.open(pdf_path) as pdf:
-        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+def parse_totals_from_text(text):
+    """
+    Parse subtotal, VAT, total amounts using regex. Use some heuristics to pick sensible matches.
+    """
+    # Try direct finds for VAT and total
+    vat_m = VAT_RE.search(text)
+    total_m = TOTAL_RE.search(text)
+    subtotal_m = SUBTOTAL_RE.search(text)
 
-    res = {
-        "total_excluding_vat": None,
-        "vat_amount": None,
-        "total_including_vat": None
-    }
+    vat = norm_amount(safe_get(vat_m)) if vat_m else None
+    total = norm_amount(safe_get(total_m)) if total_m else None
+    subtotal = norm_amount(safe_get(subtotal_m)) if subtotal_m else None
 
-    # common patterns - relaxed
-    patterns = [
-        (r"Total excluding VAT[:\s]*£\s*([\d,]+\.\d{1,2})", "total_excluding_vat"),
-        (r"Total excluding VAT[:\s]*([\d,]+\.\d{1,2})", "total_excluding_vat"),
-        (r"VAT at \d{1,2}%[:\s]*£\s*([\d,]+\.\d{1,2})", "vat_amount"),
-        (r"Total VAT[:\s]*£\s*([\d,]+\.\d{1,2})", "vat_amount"),
-        (r"TOTAL which includes total VAT of[:\s]*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
-        (r"Total for this bill[:\s]*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
-        (r"TOTAL[:\s]*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
-        (r"TOTAL\s*=\s*£\s*([\d,]+\.\d{1,2})", "total_including_vat"),
-    ]
-
-    for patt, key in patterns:
-        m = re.search(patt, full_text, flags=re.IGNORECASE)
-        if m:
-            try:
-                res[key] = float(m.group(1).replace(",",""))
-            except:
-                pass
-
-    # fallback: find last big monetary value as total
-    if res["total_including_vat"] is None:
-        all_amounts = [float(x.replace("£","").replace(",","")) for x in re.findall(r"£\s*([\d,]+\.\d{1,2})", full_text)]
+    # If total not found, try last occurrence of an amount in the doc (often total at bottom)
+    if not total:
+        all_amounts = AMOUNT_RE.findall(text)
         if all_amounts:
-            res["total_including_vat"] = all_amounts[-1]
-    return res
+            try:
+                total = norm_amount(all_amounts[-1])
+            except Exception:
+                total = None
 
-# ---- Comparison & HTML generation -----------------------------------------
-HTML_TMPL = """
+    # If vat not explicit but subtotal & total present, compute vat = total - subtotal
+    if vat is None and subtotal and total:
+        try:
+            vat = (total - subtotal).quantize(Decimal("0.01"))
+        except Exception:
+            vat = None
+
+    # final clean
+    return subtotal, vat, total
+
+def parse_account_number(text):
+    m = ACCOUNT_RE.search(text)
+    if m:
+        return safe_get(m)
+    # fallback: sometimes "Account:" followed by digits in same line
+    m2 = re.search(r"Account[:\s]*([0-9\-]{6,})", text, re.I)
+    return safe_get(m2)
+
+def parse_bill(pdf_path):
+    """
+    Extract text and parse the major fields. Returns ParsedBill.
+    """
+    text = extract_pdf_text(pdf_path)
+    acct = parse_account_number(text)
+    address = parse_billing_address_from_text(text)
+    products = parse_products_from_text(text)
+    subtotal, vat, total = parse_totals_from_text(text)
+
+    return ParsedBill(
+        file=os.path.basename(pdf_path),
+        account_number=acct,
+        billing_address=address,
+        products=products,
+        subtotal=subtotal,
+        vat=vat,
+        total=total,
+        raw_text=text
+    )
+
+# ---------------------------
+# Comparison logic
+# ---------------------------
+
+def compare_parsed(a: ParsedBill, b: ParsedBill):
+    """
+    Compare ParsedBill objects and return a comparison dictionary.
+    """
+    diffs = {}
+    # Account number
+    diffs['account_number'] = {"a": a.account_number, "b": b.account_number, "equal": (a.account_number == b.account_number)}
+
+    # Billing address (normalize by collapsing whitespace & lower)
+    addr_a = collapse_whitespace(a.billing_address).lower() if a.billing_address else None
+    addr_b = collapse_whitespace(b.billing_address).lower() if b.billing_address else None
+    diffs['billing_address'] = {"a": a.billing_address, "b": b.billing_address, "equal": (addr_a == addr_b)}
+
+    # Totals/subtotal/vat (compare Decimal values)
+    diffs['subtotal'] = {"a": str(a.subtotal) if a.subtotal else None, "b": str(b.subtotal) if b.subtotal else None, "equal": (a.subtotal == b.subtotal)}
+    diffs['vat'] = {"a": str(a.vat) if a.vat else None, "b": str(b.vat) if b.vat else None, "equal": (a.vat == b.vat)}
+    diffs['total'] = {"a": str(a.total) if a.total else None, "b": str(b.total) if b.total else None, "equal": (a.total == b.total)}
+
+    # Products: compare by description and amount. Build maps to amounts aggregated by desc
+    def product_map(products):
+        mp = defaultdict(Decimal)
+        for p in products:
+            key = p["desc"].lower()
+            amt = p.get("amount") or Decimal("0.00")
+            mp[key] += amt
+        return dict(mp)
+
+    mp_a = product_map(a.products)
+    mp_b = product_map(b.products)
+    # Collect union of product keys
+    all_keys = set(mp_a.keys()) | set(mp_b.keys())
+    prod_diffs = {}
+    for k in sorted(all_keys):
+        prod_diffs[k] = {"a": str(mp_a.get(k)) if mp_a.get(k) is not None else None,
+                         "b": str(mp_b.get(k)) if mp_b.get(k) is not None else None,
+                         "equal": (mp_a.get(k) == mp_b.get(k))}
+    diffs['products'] = prod_diffs
+
+    # Add a simple match score (fraction of equal fields among key top-level fields)
+    key_checks = ['account_number', 'billing_address', 'subtotal', 'vat', 'total']
+    equal_count = sum(1 for k in key_checks if diffs[k]["equal"])
+    score = round(equal_count / len(key_checks) * 100, 1)
+    diffs['match_score'] = score
+
+    return diffs
+
+# ---------------------------
+# HTML Reporting (Jinja template)
+# ---------------------------
+
+REPORT_TEMPLATE = """
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Bill Comparison Report</title>
+  <meta charset="utf-8"/>
+  <title>BT Bill Comparison - {{ file_a }} vs {{ file_b }}</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 18px; }
-    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+    body { font-family: Arial, sans-serif; margin: 24px; color: #222; }
+    header { display:flex; justify-content:space-between; align-items:center; }
+    h1 { margin:0; color:#004aad; }
+    .meta { font-size:0.9em; color:#555; }
+    table { width:100%; border-collapse: collapse; margin-top: 16px; }
     th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
-    th { background: #f2f2f2; }
-    .added { background: #e6ffea; }   /* green */
-    .removed { background: #ffe6e6; } /* red */
-    .changed { background: #fff7d6; } /* yellow */
-    .mono { font-family: monospace; white-space: pre-wrap; }
-    caption { text-align:left; font-weight:bold; padding:6px 0; }
+    th { background: #f2f2f2; text-align:left; }
+    .eq { background: #eaf6ea; }
+    .ne { background: #fff3f2; }
+    .prod-table th, .prod-table td { font-size: 0.95em; }
+    .score { font-weight: bold; padding: 6px 10px; border-radius: 4px; display:inline-block; }
+    .score.good { background:#dff0d8; color:#3c763d; }
+    .score.bad  { background:#f2dede; color:#a94442; }
+    .small { font-size:0.9em; color:#444; }
+    .collapsible { cursor:pointer; }
   </style>
 </head>
 <body>
-  <h1>Full PDF Structured Comparison</h1>
+<header>
+  <div>
+    <h1>BT Bill Comparison</h1>
+    <div class="meta">Files compared: <strong>{{ file_a }}</strong> &nbsp; vs &nbsp; <strong>{{ file_b }}</strong></div>
+    <div class="meta">Report generated: {{ now }}</div>
+  </div>
+  <div style="text-align:right">
+    <div>Match score: 
+      {% if diffs.match_score >= 80 %}
+        <span class="score good">{{ diffs.match_score }}%</span>
+      {% else %}
+        <span class="score bad">{{ diffs.match_score }}%</span>
+      {% endif %}
+    </div>
+  </div>
+</header>
 
-  <h2>Totals & VAT Summary</h2>
+<section>
+  <h2>Overview</h2>
   <table>
-    <tr><th>Field</th><th>Old Bill</th><th>New Bill</th><th>Change</th></tr>
-    <tr><td>Total excluding VAT</td><td>{{totals.old.total_excluding_vat}}</td><td>{{totals.new.total_excluding_vat}}</td><td>{{totals.change.total_excluding_vat}}</td></tr>
-    <tr><td>VAT amount</td><td>{{totals.old.vat_amount}}</td><td>{{totals.new.vat_amount}}</td><td>{{totals.change.vat_amount}}</td></tr>
-    <tr><td><b>Total including VAT</b></td><td><b>{{totals.old.total_including_vat}}</b></td><td><b>{{totals.new.total_including_vat}}</b></td><td><b>{{totals.change.total_including_vat}}</b></td></tr>
+    <tr><th>Field</th><th>Bill A</th><th>Bill B</th><th>Status</th></tr>
+    <tr class="{{ 'eq' if diffs.account_number.equal else 'ne' }}"><td>Account Number</td><td>{{ a.account_number }}</td><td>{{ b.account_number }}</td><td>{{ 'OK' if diffs.account_number.equal else 'DIFF' }}</td></tr>
+    <tr class="{{ 'eq' if diffs.billing_address.equal else 'ne' }}"><td>Billing Address</td><td>{{ a.billing_address or '—' }}</td><td>{{ b.billing_address or '—' }}</td><td>{{ 'OK' if diffs.billing_address.equal else 'DIFF' }}</td></tr>
+    <tr class="{{ 'eq' if diffs.subtotal.equal else 'ne' }}"><td>Subtotal</td><td>{{ a.subtotal or '—' }}</td><td>{{ b.subtotal or '—' }}</td><td>{{ 'OK' if diffs.subtotal.equal else 'DIFF' }}</td></tr>
+    <tr class="{{ 'eq' if diffs.vat.equal else 'ne' }}"><td>VAT</td><td>{{ a.vat or '—' }}</td><td>{{ b.vat or '—' }}</td><td>{{ 'OK' if diffs.vat.equal else 'DIFF' }}</td></tr>
+    <tr class="{{ 'eq' if diffs.total.equal else 'ne' }}"><td>Total</td><td>{{ a.total or '—' }}</td><td>{{ b.total or '—' }}</td><td>{{ 'OK' if diffs.total.equal else 'DIFF' }}</td></tr>
   </table>
+</section>
 
-  <h2>Line Item Comparison</h2>
-  <table>
-    <tr><th style="width:45%">Description (section + description)</th><th style="width:15%">Old Amount</th><th style="width:15%">New Amount</th><th style="width:15%">Change</th></tr>
-    {% for r in rows %}
-      <tr class="{{r.cls}}">
-        <td>{{ r.section }} — {{ r.description }}</td>
-        <td style="text-align:right">{{ r.amount_old }}</td>
-        <td style="text-align:right">{{ r.amount_new }}</td>
-        <td style="text-align:right">{{ r.delta }}</td>
+<section>
+  <h2>Products / Line Items</h2>
+  <table class="prod-table">
+    <tr><th>Product (normalized)</th><th>Bill A Amount</th><th>Bill B Amount</th><th>Status</th></tr>
+    {% for desc, pd in diffs.products.items() %}
+      <tr class="{{ 'eq' if pd.equal else 'ne' }}">
+        <td>{{ desc }}</td>
+        <td>{{ pd.a }}</td>
+        <td>{{ pd.b }}</td>
+        <td>{{ 'OK' if pd.equal else 'DIFF' }}</td>
       </tr>
     {% endfor %}
   </table>
+</section>
 
-  <h2>Raw extraction preview (old)</h2>
-  <div class="mono">{{ raw_old }}</div>
+<section>
+  <h2>Raw Text Snapshots (for debugging)</h2>
+  <div class="small">
+    <h3 class="collapsible">Bill A - {{ a.file }}</h3>
+    <pre style="white-space:pre-wrap; border:1px solid #eee; padding:10px; max-height:220px; overflow:auto;">{{ a.raw_text[:4000] }}{% if a.raw_text|length > 4000 %} ... (truncated){% endif %}</pre>
 
-  <h2>Raw extraction preview (new)</h2>
-  <div class="mono">{{ raw_new }}</div>
+    <h3 class="collapsible">Bill B - {{ b.file }}</h3>
+    <pre style="white-space:pre-wrap; border:1px solid #eee; padding:10px; max-height:220px; overflow:auto;">{{ b.raw_text[:4000] }}{% if b.raw_text|length > 4000 %} ... (truncated){% endif %}</pre>
+  </div>
+</section>
 
+<footer style="margin-top:20px; font-size:0.9em; color:#666;">
+  Generated by BT Bill Compare tool • {{ now }}
+</footer>
 </body>
 </html>
 """
 
-def compare_and_report(old_pdf, new_pdf, out_html="bill_comparison_report.html"):
-    # Extract words & rows
-    words_old = extract_words_with_layout(old_pdf)
-    words_new = extract_words_with_layout(new_pdf)
-    rows_old = cluster_rows(words_old)
-    rows_new = cluster_rows(words_new)
-
-    # detect amount column globally using both bills
-    combined_rows = rows_old + rows_new
-    amount_x = detect_amount_column(combined_rows)
-
-    items_old = extract_items_from_rows(rows_old, amount_x_threshold=amount_x)
-    items_new = extract_items_from_rows(rows_new, amount_x_threshold=amount_x)
-
-    df_old = pd.DataFrame(items_old)
-    df_new = pd.DataFrame(items_new)
-
-    # raw text preview (top 2000 chars)
-    raw_old = "\n".join(build_row_text(r) for r in rows_old)[:20000]
-    raw_new = "\n".join(build_row_text(r) for r in rows_new)[:20000]
-
-    # totals
-    totals_old = extract_totals_textwise(old_pdf)
-    totals_new = extract_totals_textwise(new_pdf)
-    totals_change = {k: None for k in totals_old.keys()}
-    for k in totals_old.keys():
-        a = totals_old.get(k) or 0.0
-        b = totals_new.get(k) or 0.0
-        totals_change[k] = round(b - a, 2)
-
-    # merge items by key to compare
-    merged = pd.merge(df_old, df_new, on="key", how="outer", suffixes=("_old","_new"))
-
-    rows = []
-    for _, r in merged.iterrows():
-        amt_old = r.get("amount_old") if not pd.isna(r.get("amount_old")) else None
-        amt_new = r.get("amount_new") if not pd.isna(r.get("amount_new")) else None
-        desc_old = r.get("description_old") if not pd.isna(r.get("description_old")) else (r.get("description_new") if not pd.isna(r.get("description_new")) else "")
-        sect_old = r.get("section_old") if not pd.isna(r.get("section_old")) else (r.get("section_new") if not pd.isna(r.get("section_new")) else "")
-
-        delta = None
-        if amt_old is None and amt_new is not None:
-            cls = "added"
-            delta = round(amt_new,2)
-        elif amt_new is None and amt_old is not None:
-            cls = "removed"
-            delta = round(-amt_old,2)
-        elif amt_old is not None and amt_new is not None:
-            d = round(amt_new - amt_old, 2)
-            cls = "changed" if d != 0 else ""
-            delta = d
-        else:
-            cls = ""
-            delta = None
-
-        rows.append({
-            "key": r["key"],
-            "section": sect_old or "",
-            "description": desc_old or "",
-            "amount_old": f"£{amt_old:,.2f}" if amt_old is not None else "",
-            "amount_new": f"£{amt_new:,.2f}" if amt_new is not None else "",
-            "delta": (f"£{delta:+.2f}" if delta is not None else ""),
-            "cls": cls
-        })
-
-    tpl = Template(HTML_TMPL)
-    rendered = tpl.render(
-        totals={"old": totals_old, "new": totals_new, "change": totals_change},
-        rows=rows,
-        raw_old=html.escape(raw_old),
-        raw_new=html.escape(raw_new)
-    )
-
-    with open(out_html, "w", encoding="utf-8") as f:
+def generate_report_html(parsed_a: ParsedBill, parsed_b: ParsedBill, diffs: dict, out_path):
+    """
+    Render template with jinja2 Template (included in dependencies).
+    """
+    tpl = Template(REPORT_TEMPLATE)
+    rendered = tpl.render(file_a=parsed_a.file, file_b=parsed_b.file, a=parsed_a, b=parsed_b, diffs=diffs, now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(rendered)
-    print("Report generated:", out_html)
+    logger.info("Wrote report: %s", out_path)
 
-# ---- CLI ------------------------------------------------------------------
-def main(argv):
-    if len(argv) < 3:
-        print("Usage: python compare_full_structured.py old.pdf new.pdf [-o report.html]")
-        return
-    old_pdf = argv[1]
-    new_pdf = argv[2]
-    out = "bill_comparison_report.html"
-    if "-o" in argv:
-        i = argv.index("-o")
-        if i+1 < len(argv):
-            out = argv[i+1]
-    compare_and_report(old_pdf, new_pdf, out)
+# ---------------------------
+# Batch orchestration
+# ---------------------------
+
+def batch_compare(dir_a, dir_b, out_dir, pair_list=None):
+    """
+    Compare files present in both dir_a and dir_b by identical filename.
+    pair_list: optional list of filenames to pair (only those will be processed).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    files_a = [f for f in os.listdir(dir_a) if f.lower().endswith(".pdf")]
+    files_b = set([f for f in os.listdir(dir_b) if f.lower().endswith(".pdf")])
+
+    to_process = []
+    for f in files_a:
+        if pair_list and f not in pair_list:
+            continue
+        if f in files_b:
+            to_process.append(f)
+        else:
+            logger.warning("No matching file for %s in %s (skipping)", f, dir_b)
+
+    index_entries = []
+    for fname in sorted(to_process):
+        path_a = os.path.join(dir_a, fname)
+        path_b = os.path.join(dir_b, fname)
+        try:
+            parsed_a = parse_bill(path_a)
+            parsed_b = parse_bill(path_b)
+            diffs = compare_parsed(parsed_a, parsed_b)
+            # Report filename
+            report_name = fname.rsplit(".", 1)[0] + "_comparison.html"
+            out_path = os.path.join(out_dir, report_name)
+            generate_report_html(parsed_a, parsed_b, diffs, out_path)
+            index_entries.append({"file": fname, "report": report_name, "score": diffs.get("match_score", 0)})
+        except Exception as e:
+            logger.exception("Failed to compare %s: %s", fname, e)
+
+    # Generate index
+    index_path = os.path.join(out_dir, "index.html")
+    generate_index(index_entries, index_path, out_dir)
+    logger.info("Batch complete. Reports in: %s", out_dir)
+
+def generate_index(entries, out_path, reports_folder):
+    """Simple index HTML linking all generated reports and sorting by score."""
+    entries_sorted = sorted(entries, key=lambda x: x["score"])
+    lines = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append("<!doctype html><html><head><meta charset='utf-8'><title>BT Bill Comparison Index</title>")
+    lines.append("<style>body{font-family:Arial;margin:20px} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:8px} th{background:#f2f2f2}</style></head><body>")
+    lines.append(f"<h1>BT Bill Comparison Index</h1><p>Generated: {now}</p>")
+    lines.append("<table><tr><th>File</th><th>Report</th><th>Match Score</th></tr>")
+    for e in entries_sorted:
+        lines.append(f"<tr><td>{html.escape(e['file'])}</td><td><a href=\"{html.escape(e['report'])}\">{html.escape(e['report'])}</a></td><td>{e['score']}%</td></tr>")
+    lines.append("</table></body></html>")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    logger.info("Wrote index: %s", out_path)
+
+# ---------------------------
+# CLI
+# ---------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare BT Business bill PDFs in two folders and generate HTML reports.")
+    parser.add_argument("--dirA", required=True, help="Path to folder A (e.g. source)")
+    parser.add_argument("--dirB", required=True, help="Path to folder B (e.g. target)")
+    parser.add_argument("--out", required=True, help="Output folder for HTML reports")
+    parser.add_argument("--files", nargs="*", default=None, help="Optional list of specific filenames to compare (space-separated)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+
+    if not os.path.isdir(args.dirA) or not os.path.isdir(args.dirB):
+        logger.error("Both dirA and dirB must be valid directories.")
+        sys.exit(1)
+
+    batch_compare(args.dirA, args.dirB, args.out, pair_list=args.files)
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
