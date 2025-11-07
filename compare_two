@@ -1,642 +1,256 @@
-#!/usr/bin/env python3
-"""
-bt_bill_compare_final.py
-
-Final enhanced BT bill comparator (single-file).
-- Page-1-only billing address and account extraction (account from top-right).
-- Category-aware line-item extraction (no cross-category summation).
-- Ignore informational lines, dates/years, and sidebar numbers.
-- HTML report per file plus index.html for batch.
-
-Usage:
-    python bt_bill_compare_final.py --dirA ./a --dirB ./b --out ./reports
-
-Dependencies:
-    pip install pymupdf pillow pytesseract pdf2image jinja2 rapidfuzz
-    (system: tesseract, poppler for OCR)
-"""
-
 import os
 import re
-import io
-import sys
-import argparse
-import logging
+import fitz  # PyMuPDF
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
-from collections import defaultdict, namedtuple
-from difflib import SequenceMatcher
+from jinja2 import Template
+import logging
 
-# optional fast fuzzy
-try:
-    from rapidfuzz import fuzz
-    HAVE_RAPIDFUZZ = True
-except Exception:
-    HAVE_RAPIDFUZZ = False
-
-# pdf & image libs
-try:
-    import fitz  # PyMuPDF
-    from PIL import Image
-    import pytesseract
-    from pdf2image import convert_from_path
-    from jinja2 import Template
-except Exception as e:
-    print("Missing Python dependencies. Install: pip install pymupdf pillow pytesseract pdf2image jinja2 rapidfuzz")
-    raise
-
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("bt-bill-compare-final")
-
-# Patterns
-AMOUNT_RE = re.compile(r"-?£?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)")
-YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
-DATE_RE = re.compile(r"\b(?:\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|\d{1,2}/\d{1,2}/\d{2,4})\b", re.I)
-ACCOUNT_TOKEN_RE = re.compile(r"(VP\s*\d{4}\s*\d{4}|[A-Z]{1,3}\s*\d{2,6})", re.I)  # capture VP 0024 5678 or similar
-
-# Sections keywords ordered roughly in priority for detection
-SECTION_KEYWORDS = {
-    "regular_charges": ["regular charges", "regular charge", "regular charges -"],
-    "one_off": ["one-off charges and credits", "one off charges and credits", "one-off charges", "one off charges"],
-    "discounts": ["discounts"],
-    "vt_summary": ["vat summary", "your vat summary", "total vat", "vat at"],
-    "charges_detail": ["your charges in detail", "charges for", "usage charges"],
-    "overview": ["total for this bill", "total owed on this account", "this bill"]
-}
-
-ParsedBill = namedtuple("ParsedBill", ["file", "account", "billing_address", "items", "vat_summary", "subtotal", "vat", "total", "raw_pages"])
+logger = logging.getLogger(__name__)
 
 # ----------------------------
-# Utility helpers
+# Helper functions
 # ----------------------------
-def norm_amount_str(s):
-    if s is None:
-        return None
-    s = str(s).strip().replace("£", "").replace(",", "")
-    try:
-        return Decimal(s).quantize(Decimal("0.01"))
-    except Exception:
-        try:
-            return Decimal(float(s)).quantize(Decimal("0.01"))
-        except Exception:
-            return None
 
-def similar(a, b):
-    if not a or not b:
-        return 0
-    if HAVE_RAPIDFUZZ:
-        return fuzz.token_sort_ratio(a, b)
-    else:
-        return int(SequenceMatcher(None, a, b).ratio() * 100)
-
-# ----------------------------
-# Layout-aware extraction
-# ----------------------------
-def extract_spans(pdf_path, use_ocr_fallback=True, ocr_dpi=200):
-    """
-    Return pages_spans: list of dicts {"width": page_width, "height": page_height, "spans":[{text,x0,y0,x1,y1,size}]}
-    """
+def extract_text_blocks(pdf_path):
+    """Extract text from each page."""
+    logger.info(f"Reading: {pdf_path}")
+    doc = fitz.open(pdf_path)
     pages = []
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception as e:
-        logger.exception("Failed to open PDF %s: %s", pdf_path, e)
-        return pages
-
-    for pnum in range(len(doc)):
-        page = doc[pnum]
-        page_dict = page.get_text("dict")
-        spans = []
-        for block in page_dict.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    text = span.get("text", "").strip()
-                    if text:
-                        x0, y0, x1, y1 = span.get("bbox")
-                        spans.append({"text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1, "size": span.get("size")})
-        # fallbackocr if sparse
-        if use_ocr_fallback and len(spans) < 6:
-            try:
-                pix = page.get_pixmap(dpi=ocr_dpi)
-                img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-                ocr_text = pytesseract.image_to_string(img)
-                base_y = page.rect.y1 - 30
-                for i, ln in enumerate([l for l in ocr_text.splitlines() if l.strip()]):
-                    spans.append({"text": ln.strip(), "x0": 0, "y0": base_y + i*9, "x1": page.rect.x1, "y1": base_y + i*9 + 8, "size": 10})
-            except Exception:
-                pass
-        pages.append({"width": page.rect.x1, "height": page.rect.y1, "spans": spans})
+    for page in doc:
+        text = page.get_text("text")
+        pages.append(text)
     doc.close()
     return pages
 
-def group_spans_to_rows(spans, y_tol=3):
-    """Group spans into rows by similar y coordinate and sort left->right."""
-    if not spans:
-        return []
-    sorted_spans = sorted(spans, key=lambda s: (round(s["y0"]), s["x0"]))
-    rows = []
-    cur_y = None
-    cur = []
-    for s in sorted_spans:
-        y = round(s["y0"])
-        if cur_y is None:
-            cur_y = y
-            cur = [s]
-        elif abs(y - cur_y) <= y_tol:
-            cur.append(s)
-        else:
-            rows.append(sorted(cur, key=lambda ss: ss["x0"]))
-            cur = [s]
-            cur_y = y
-    if cur:
-        rows.append(sorted(cur, key=lambda ss: ss["x0"]))
-    # convert to structured rows
-    out = []
-    for r in rows:
-        text = " ".join([sp["text"] for sp in r])
-        out.append({"y": r[0]["y0"], "spans": r, "text": text})
-    return out
 
-def detect_sidebar_x_threshold(spans):
-    """Detect x threshold to treat as sidebar — use 85th percentile of x0 positions as heuristic."""
-    if not spans:
-        return None
-    xs = sorted([s["x0"] for s in spans])
-    if not xs:
-        return None
-    idx = int(len(xs) * 0.85)
-    p85 = xs[min(idx, len(xs)-1)]
-    return p85 - 8
-
-# ----------------------------
-# Page1-only account & address extraction
-# ----------------------------
-def extract_account_and_address_from_page1(pages_spans):
-    """
-    pages_spans: list of page dicts returned by extract_spans.
-    Only use page index 0.
-    Returns (account_str_or_None, billing_address_or_None)
-    """
-    if not pages_spans:
-        return None, None
-    first = pages_spans[0]
-    page_w = first["width"]
-    page_h = first["height"]
-    rows = group_spans_to_rows(first["spans"])
-    sidebar_thr = detect_sidebar_x_threshold(first["spans"]) or (page_w * 0.78)
-
-    # ACCOUNT: look for "Account" tokens in top-right region (y small, x large)
-    account = None
-    for r in rows:
-        # only top portion (top 25% of page)
-        if r["y"] > page_h * 0.25:
+def extract_billing_address(page1_text):
+    """Extract billing address (always from first page)."""
+    lines = page1_text.split("\n")
+    address_lines = []
+    start = False
+    for line in lines:
+        if "Billing address" in line:
+            start = True
             continue
-        # check spans in this row that are in right half
-        for sp in r["spans"]:
-            mid = (sp["x0"] + sp["x1"]) / 2.0
-            if mid < page_w * 0.5:
-                continue
-            txt = sp["text"]
-            if "account" in txt.lower():
-                # extract neighbor spans on same row to the right with candidate token
-                # join texts to the right of 'account' spans
-                joined = " ".join([s["text"] for s in r["spans"] if s["x0"] >= sp["x0"]])
-                m = ACCOUNT_TOKEN_RE.search(joined)
-                if m:
-                    account = m.group(1).strip()
-                    return account, extract_billing_address_rows(rows)  # return early if found
-
-    # fallback: search any top-right span for VP pattern
-    for r in rows:
-        if r["y"] > page_h * 0.25:
-            continue
-        for sp in r["spans"]:
-            mid = (sp["x0"] + sp["x1"]) / 2.0
-            if mid < sidebar_thr:
-                continue
-            m = ACCOUNT_TOKEN_RE.search(sp["text"])
-            if m:
-                account = m.group(1).strip()
+        if start:
+            if line.strip() == "":
                 break
-        if account:
-            break
+            address_lines.append(line.strip())
+    return "\n".join(address_lines) if address_lines else "Not Found"
 
-    # Billing address: find the 'Billing address' label and collect following lines (only on page1)
-    billing_address = None
-    addr_lines = []
-    found_label = False
-    for idx, r in enumerate(rows):
-        if "billing address" in r["text"].lower():
-            found_label = True
-            # collect up to next 6 rows or until blank or next header
-            for j in range(idx+1, min(len(rows), idx+7)):
-                nxt = rows[j]["text"].strip()
-                if not nxt:
-                    break
-                # stop if nxt looks like a section header
-                if any(k in nxt.lower() for kws in SECTION_KEYWORDS.values() for k in kws):
-                    break
-                addr_lines.append(nxt)
-            break
-    if addr_lines:
-        billing_address = " ".join(addr_lines).strip()
-    return account, billing_address
 
-def extract_billing_address_rows(rows):
-    # helper to re-use (in case account found earlier)
-    addr_lines = []
-    for idx, r in enumerate(rows):
-        if "billing address" in r["text"].lower():
-            for j in range(idx+1, min(len(rows), idx+7)):
-                nxt = rows[j]["text"].strip()
-                if not nxt:
-                    break
-                if any(k in nxt.lower() for kws in SECTION_KEYWORDS.values() for k in kws):
-                    break
-                addr_lines.append(nxt)
-            break
-    return " ".join(addr_lines).strip() if addr_lines else None
+def extract_account_number(page1_text):
+    """Extract account number (top right corner, looks like 'Account number VP 0024 5678')."""
+    match = re.search(r"Account\s*number\s*(VP\s*\d{4}\s*\d{4})", page1_text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return "Not Found"
 
-# ----------------------------
-# Parse pages into sections & items
-# ----------------------------
-def detect_section_for_text(text):
-    t = text.lower()
-    for key, kws in SECTION_KEYWORDS.items():
-        for kw in kws:
-            if kw in t:
-                return key
-    return None
 
-def split_row_left_right(row, page_width, split_pct=0.62):
-    """Return (left_text, right_text) using split percent of page width"""
-    split_x = page_width * split_pct
-    left_parts = []
-    right_parts = []
-    for sp in row["spans"]:
-        mid = (sp["x0"] + sp["x1"]) / 2.0
-        if mid <= split_x:
-            left_parts.append((sp["x0"], sp["text"]))
-        else:
-            right_parts.append((sp["x0"], sp["text"]))
-    left = " ".join([p[1] for p in sorted(left_parts)]) if left_parts else ""
-    right = " ".join([p[1] for p in sorted(right_parts)]) if right_parts else ""
-    return left.strip(), right.strip()
+def is_amount_like(text):
+    """Check if the text looks like an amount (has £ or is a right-aligned number)."""
+    if not text:
+        return False
+    if "£" in text:
+        return True
+    # reject years/dates
+    if re.search(r"\b(19|20)\d{2}\b", text):
+        return False
+    # typical monetary formats
+    if re.match(r"^-?\d{1,3}(,\d{3})*(\.\d{2})?$", text.strip()):
+        return True
+    return False
 
-def span_amount_in_main(span, page_width, sidebar_thr):
-    """Check whether a span text is an amount token and left of sidebar threshold."""
-    mid = (span["x0"] + span["x1"]) / 2.0
-    if mid >= sidebar_thr:
-        return None
-    m = AMOUNT_RE.search(span["text"])
-    if not m:
-        return None
-    token = m.group(1)
-    # exclude years and dates
-    if YEAR_RE.search(token) or DATE_RE.search(span["text"]):
-        return None
-    return token
 
-def parse_pages_to_items(pages_spans):
+def extract_line_items(pages):
     """
-    Parse the whole document into:
-      - items: dict keyed by (section, normalized_desc) -> {'amount':Decimal, 'example':raw_left, 'page':p}
-      - vat_summary, subtotal, vat, total
-    Important: items are kept per-section (no cross-section sums).
+    Extract line items per category.
+    Skip non-charge text lines.
     """
-    items = {}
-    pages_rows = []
-    # first compute rows & sidebar threshold per page
-    for p in pages_spans:
-        rows = group_spans_to_rows(p["spans"])
-        thr = detect_sidebar_x_threshold(p["spans"]) or (p["width"] * 0.85)
-        pages_rows.append({"width": p["width"], "height": p["height"], "rows": rows, "sidebar_thr": thr})
+    data = {}
+    category = None
 
-    current_section = None
-    subtotal = vat = total = None
-    vat_summary = {}
-
-    for p_idx, page in enumerate(pages_rows):
-        w = page["width"]
-        thr = page["sidebar_thr"]
-        for r in page["rows"]:
-            text = r["text"].strip()
-            if not text:
-                continue
-            # detect section headings
-            sec = detect_section_for_text(text)
-            if sec:
-                current_section = sec
+    for i, page_text in enumerate(pages):
+        lines = [l.strip() for l in page_text.split("\n") if l.strip()]
+        for idx, line in enumerate(lines):
+            # Detect categories
+            if re.search(r"(Regular charges|One[- ]off charges and credits|Discounts|VAT summary)", line, re.IGNORECASE):
+                category = line.strip()
+                if category not in data:
+                    data[category] = {}
                 continue
 
-            # Skip purely informational lines that have no amounts (common)
-            low = text.lower()
-            info_phrases = ["these figures exclude", "your offer ends on", "there was no chargeable usage", "vat at", "total vat", "total for items where vat", "billing address", "account number", "total owed", "total for this bill"]
-            if any(p in low for p in info_phrases) and not AMOUNT_RE.search(text):
+            # Skip non-charge or purely informational lines
+            if any(kw in line.lower() for kw in ["vat", "figures exclude", "offer ends", "page", "account number"]):
                 continue
 
-            # split left/right
-            left, right = split_row_left_right(r, w)
-
-            # Attempt to get amount from spans that are not in sidebar
-            amount_token = None
-            # check spans left->right, prefer spans near right area but before sidebar threshold
-            right_spans = [s for s in r["spans"] if (s["x0"] + s["x1"])/2.0 > (w * 0.55)]
-            for sp in right_spans:
-                tok = span_amount_in_main(sp, w, thr)
-                if tok:
-                    amount_token = tok
-                    break
-            # fallback: check any span left of sidebar threshold
-            if not amount_token:
-                for sp in r["spans"]:
-                    tok = span_amount_in_main(sp, w, thr)
-                    if tok:
-                        amount_token = tok
-                        break
-            # fallback: check right string tokens (but ensure their average X < thr)
-            if not amount_token and right:
-                m = AMOUNT_RE.search(right)
-                if m and not YEAR_RE.search(m.group(1)) and not DATE_RE.search(right):
-                    amount_token = m.group(1)
-
-            # ignore rows where amount_token is clearly a date/year
-            if amount_token and YEAR_RE.search(amount_token):
-                amount_token = None
-
-            # if no amount found, skip (non-charge explanatory row)
-            if not amount_token:
-                continue
-
-            amount = norm_amount_str(amount_token)
-            if amount is None:
-                continue
-
-            # normalize left for description
-            desc = left.strip()
-            # remove trailing tokens like ":", stray amounts/dates
-            desc = re.sub(r"\b(£|pounds|GBP)\b", "", desc, flags=re.I)
-            desc = re.sub(r"\b(?:\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|\d{1,2}/\d{1,2}/\d{2,4})\b", "", desc, flags=re.I)
-            desc = re.sub(r"\b(19|20)\d{2}\b", "", desc)
-            desc = re.sub(r"[^\w\s\-\&\(\)\,\/\.]", " ", desc)
-            desc = re.sub(r"\s+", " ", desc).strip().lower()
-            if not desc:
-                continue
-
-            sec_key = current_section or "unknown"
-            key = (sec_key, desc)
-
-            # ensure we don't combine across categories. If same (sec,desc) repeats (split lines), keep strategy:
-            # if exact key exists and same amount found, keep; if different amount found create new unique key suffix to preserve both
-            if key not in items:
-                items[key] = {"amount": amount, "example": left, "page": p_idx}
+            # Try to detect a potential amount near right edge
+            parts = re.split(r"\s{2,}", line)
+            if len(parts) > 1 and is_amount_like(parts[-1]):
+                item_name = parts[0].strip()
+                amount = parts[-1].strip().replace("£", "").replace(",", "")
+                if category and item_name:
+                    data[category][item_name] = float(amount)
             else:
-                prev = items[key]["amount"]
-                if prev == amount:
-                    # duplicate same value — ignore
-                    pass
-                else:
-                    # create unique key variant to avoid losing distinct line items
-                    cnt = 1
-                    newkey = (sec_key, f"{desc}__{cnt}")
-                    while newkey in items:
-                        cnt += 1
-                        newkey = (sec_key, f"{desc}__{cnt}")
-                    items[newkey] = {"amount": amount, "example": left, "page": p_idx}
+                # handle single-part lines with £amount inside
+                if "£" in line and category:
+                    match = re.search(r"£\s*([0-9,]+\.\d{2})", line)
+                    if match:
+                        item_name = line.split("£")[0].strip()
+                        amount = match.group(1).replace(",", "")
+                        data[category][item_name] = float(amount)
 
-            # Additionally parse totals/vat if the row text seems like totals lines
-            lt = text.lower()
-            if "total excluding vat" in lt or "total for items where vat" in lt:
-                subtotal = amount
-                vat_summary["total_excluding_vat"] = amount
-            if "vat at" in lt or re.search(r"vat at \d+%", lt):
-                vat = amount
-                vat_summary["vat_at_rate"] = amount
-            if "total vat" in lt and "total for items" not in lt:
-                vat_summary["total_vat"] = amount
-            if ("total for this bill" in lt) or ("total owed on this account" in lt) or lt.strip().startswith("total"):
-                total = amount
-                vat_summary["total_for_bill"] = amount
+    return data
 
-    # convert items into string-keyed map for templating
-    items_out = {}
-    for (sec, desc), meta in items.items():
-        k = f"{sec}||{desc}"
-        items_out[k] = {"amount": str(meta["amount"].quantize(Decimal("0.01"))), "example": meta["example"], "page": meta["page"]}
-    return items_out, vat_summary, subtotal, vat, total, pages_rows
 
-# ----------------------------
-# High-level parse per PDF
-# ----------------------------
-def parse_pdf_layout(pdf_path):
-    logger.info("Parsing (layout) %s", pdf_path)
-    pages_spans = extract_spans(pdf_path)
-    account, billing_address = extract_account_and_address_from_page1(pages_spans)
-    items_map, vat_summary, subtotal, vat, total, raw_pages = parse_pages_to_items(pages_spans)
-    return ParsedBill(file=os.path.basename(pdf_path), account=account, billing_address=billing_address,
-                      items=items_map, vat_summary=vat_summary, subtotal=subtotal, vat=vat, total=total, raw_pages=raw_pages)
+def compare_dicts(dict_a, dict_b):
+    """Compare two parsed dictionaries."""
+    diffs = {"items": {}, "vat_summary": {}}
+    all_cats = set(dict_a.keys()) | set(dict_b.keys())
 
-# ----------------------------
-# Comparison logic
-# ----------------------------
-def compare_parsed(a: ParsedBill, b: ParsedBill, amt_tol=Decimal("0.01")):
-    diffs = {}
-    diffs["account"] = {"a": a.account, "b": b.account, "equal": (a.account == b.account)}
-    addr_sim = similar(a.billing_address or "", b.billing_address or "")
-    diffs["address"] = {"a": a.billing_address, "b": b.billing_address, "similarity": addr_sim, "equal": (addr_sim >= 90)}
+    for cat in all_cats:
+        items_a = dict_a.get(cat, {})
+        items_b = dict_b.get(cat, {})
+        all_items = set(items_a.keys()) | set(items_b.keys())
 
-    def approx_eq(x, y):
-        if x is None and y is None:
-            return True
-        if x is None or y is None:
-            return False
-        try:
-            return abs(x - y) <= amt_tol
-        except Exception:
-            return False
+        for item in all_items:
+            a_val = items_a.get(item)
+            b_val = items_b.get(item)
+            status = "OK"
+            if a_val is None and b_val is None:
+                status = "N/A"
+            elif a_val is None:
+                status = "Missing in A"
+            elif b_val is None:
+                status = "Missing in B"
+            elif round(a_val, 2) != round(b_val, 2):
+                status = "DIFF"
+            diffs["items"][f"{cat} | {item}"] = {
+                "a_amount": a_val,
+                "b_amount": b_val,
+                "equal": status == "OK",
+                "status": status
+            }
 
-    diffs["subtotal"] = {"a": str(a.subtotal) if a.subtotal else None, "b": str(b.subtotal) if b.subtotal else None, "equal": approx_eq(a.subtotal, b.subtotal)}
-    diffs["vat"] = {"a": str(a.vat) if a.vat else None, "b": str(b.vat) if b.vat else None, "equal": approx_eq(a.vat, b.vat)}
-    diffs["total"] = {"a": str(a.total) if a.total else None, "b": str(b.total) if b.total else None, "equal": approx_eq(a.total, b.total)}
-
-    # items comparison by literal keys (section||desc)
-    keys = sorted(set(list(a.items.keys()) + list(b.items.keys())))
-    items_diff = {}
-    for k in keys:
-        ai = a.items.get(k)
-        bi = b.items.get(k)
-        a_amt = Decimal(ai["amount"]) if ai else None
-        b_amt = Decimal(bi["amount"]) if bi else None
-        equal = approx_eq(a_amt, b_amt)
-        delta = None
-        if a_amt is not None and b_amt is not None:
-            try:
-                delta = (b_amt - a_amt).quantize(Decimal("0.01"))
-            except Exception:
-                delta = None
-        items_diff[k] = {
-            "a_amount": str(a_amt) if a_amt is not None else None,
-            "b_amount": str(b_amt) if b_amt is not None else None,
-            "equal": equal,
-            "delta": str(delta) if delta is not None else None,
-            "example_a": ai["example"] if ai else None,
-            "example_b": bi["example"] if bi else None
-        }
-
-    diffs["items"] = items_diff
-
-    # vat summary compare
-    vat_keys = set(list(a.vat_summary.keys()) + list(b.vat_summary.keys()))
-    vat_diffs = {}
-    for k in vat_keys:
-        va = a.vat_summary.get(k)
-        vb = b.vat_summary.get(k)
-        vat_diffs[k] = {"a": str(va) if va else None, "b": str(vb) if vb else None, "equal": approx_eq(va, vb)}
-    diffs["vat_summary"] = vat_diffs
-
-    # score (simple top-level)
-    top_checks = ["account", "address", "subtotal", "vat", "total"]
-    ok = sum(1 for t in top_checks if diffs[t]["equal"])
-    diffs["match_score"] = round(ok / len(top_checks) * 100, 1)
     return diffs
 
+
 # ----------------------------
-# HTML report templating
+# Template
 # ----------------------------
+
 REPORT_TMPL = """
-<!doctype html>
+<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>BT Bill Compare - {{a.file}} vs {{b.file}}</title>
-<style>
-body{font-family:Arial;margin:18px;color:#222}h1{color:#004aad}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}th{background:#f6f6f6} .ok{background:#e8f8e8} .diff{background:#fff0f0} .score{display:inline-block;padding:6px 10px;border-radius:4px} .good{background:#dff0d8;color:#3c763d} .bad{background:#f2dede;color:#a94442} pre{background:#fafafa;padding:8px;border:1px solid #eee;max-height:260px;overflow:auto}
-.small{font-size:0.9em;color:#555}
-</style>
-</head><body>
-<h1>BT Bill Comparison</h1>
-<div class="small">Files: <b>{{a.file}}</b> vs <b>{{b.file}}</b> — Generated: {{now}}</div>
-<div style="margin-top:8px;">Match score:
-{% if diffs.match_score >= 80 %}
-  <span class="score good">{{ diffs.match_score }}%</span>
-{% else %}
-  <span class="score bad">{{ diffs.match_score }}%</span>
-{% endif %}
-</div>
+<head>
+    <meta charset="utf-8">
+    <title>BT Bill Comparison Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #fafafa; color: #222; }
+        h1 { color: #0047AB; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+        th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+        th { background: #0047AB; color: white; }
+        tr.ok { background-color: #e9ffe9; }
+        tr.diff { background-color: #ffe9e9; }
+        .meta { margin-bottom: 20px; padding: 10px; background: #fff; border-radius: 8px; }
+        .meta h2 { margin: 0 0 8px 0; }
+        footer { margin-top: 30px; text-align: center; font-size: 12px; color: #666; }
+    </style>
+</head>
+<body>
+    <h1>BT Bill Comparison Report</h1>
 
-<h2>Account & Billing Address (page 1 only)</h2>
-<table><tr><th>Field</th><th>Bill A</th><th>Bill B</th><th>Status</th></tr>
-<tr class="{{ 'ok' if diffs.account.equal else 'diff' }}"><td>Account Number</td><td>{{ a.account or '—' }}</td><td>{{ b.account or '—' }}</td><td>{{ 'OK' if diffs.account.equal else 'DIFF' }}</td></tr>
-<tr class="{{ 'ok' if diffs.address.equal else 'diff' }}"><td>Billing Address</td><td>{{ a.billing_address or '—' }}</td><td>{{ b.billing_address or '—' }}</td><td>{{ 'OK' if diffs.address.equal else ('Similar: ' ~ diffs.address.similarity ~ '%') }}</td></tr>
-</table>
+    <div class="meta">
+        <h2>File A</h2>
+        <p><strong>Billing Address:</strong><br>{{ a.billing_address }}</p>
+        <p><strong>Account Number:</strong> {{ a.account_number }}</p>
+    </div>
 
-<h2>VAT & Totals</h2>
-<table><tr><th>Metric</th><th>Bill A</th><th>Bill B</th><th>Status</th></tr>
-<tr class="{{ 'ok' if diffs.subtotal.equal else 'diff' }}"><td>Subtotal (excl VAT)</td><td>{{ a.subtotal or '—' }}</td><td>{{ b.subtotal or '—' }}</td><td>{{ 'OK' if diffs.subtotal.equal else 'DIFF' }}</td></tr>
-<tr class="{{ 'ok' if diffs.vat.equal else 'diff' }}"><td>VAT</td><td>{{ a.vat or '—' }}</td><td>{{ b.vat or '—' }}</td><td>{{ 'OK' if diffs.vat.equal else 'DIFF' }}</td></tr>
-<tr class="{{ 'ok' if diffs.total.equal else 'diff' }}"><td>Total (incl VAT)</td><td>{{ a.total or '—' }}</td><td>{{ b.total or '—' }}</td><td>{{ 'OK' if diffs.total.equal else 'DIFF' }}</td></tr>
-</table>
+    <div class="meta">
+        <h2>File B</h2>
+        <p><strong>Billing Address:</strong><br>{{ b.billing_address }}</p>
+        <p><strong>Account Number:</strong> {{ b.account_number }}</p>
+    </div>
 
-<h2>VAT Summary</h2>
-<table><tr><th>Key</th><th>Bill A</th><th>Bill B</th><th>Status</th></tr>
-{% for k,v in diffs.vat_summary.items() %}
-  <tr class="{{ 'ok' if v.equal else 'diff' }}"><td>{{ k }}</td><td>{{ v.a or '—' }}</td><td>{{ v.b or '—' }}</td><td>{{ 'OK' if v.equal else 'DIFF' }}</td></tr>
-{% endfor %}
-</table>
+    <h2>Line Item Comparison</h2>
+    <table>
+        <thead>
+            <tr><th>Category | Item</th><th>File A Amount</th><th>File B Amount</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+        {% for k, v in items_map.items() %}
+            <tr class="{{ 'ok' if v.equal else 'diff' }}">
+                <td>{{ k }}</td>
+                <td>{{ v.a_amount or '—' }}</td>
+                <td>{{ v.b_amount or '—' }}</td>
+                <td>{{ v.status }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
 
-<h2>Line items (Category || Normalized Description)</h2>
-<table>
-<tr><th>Key (section||desc)</th><th>Example Description</th><th>Bill A Amount</th><th>Bill B Amount</th><th>Delta</th><th>Status</th></tr>
-{% for k,v in diffs.items.items() %}
-  <tr class="{{ 'ok' if v.equal else 'diff' }}">
-    <td style="width:30%">{{ k }}</td>
-    <td>{{ v.example_a or v.example_b or '—' }}</td>
-    <td>{{ v.a_amount or '—' }}</td>
-    <td>{{ v.b_amount or '—' }}</td>
-    <td>{{ v.delta or '—' }}</td>
-    <td>{{ 'OK' if v.equal else 'DIFF' }}</td>
-  </tr>
-{% endfor %}
-</table>
-
-<h2>Raw page snapshot (truncated)</h2>
-<div class="small">
-  <h3>Bill A - {{ a.file }}</h3>
-  <pre>{{ a.raw_pages[:4000] }}</pre>
-  <h3>Bill B - {{ b.file }}</h3>
-  <pre>{{ b.raw_pages[:4000] }}</pre>
-</div>
-
-</body></html>
+    <footer>
+        Generated on {{ now }}
+    </footer>
+</body>
+</html>
 """
 
+# ----------------------------
+# HTML generation
+# ----------------------------
+
 def generate_html(parsed_a, parsed_b, diffs, out_path):
+    """Render the final HTML report safely."""
     tpl = Template(REPORT_TMPL)
-    rendered = tpl.render(a=parsed_a, b=parsed_b, diffs=diffs, now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    items_map = dict(diffs.get("items", {}))
+    vat_map = dict(diffs.get("vat_summary", {}))
+
+    rendered = tpl.render(
+        a=parsed_a,
+        b=parsed_b,
+        diffs=diffs,
+        items_map=items_map,
+        vat_map=vat_map,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(rendered)
-    logger.info("Wrote report: %s", out_path)
+    logger.info(f"HTML report generated: {out_path}")
+
 
 # ----------------------------
-# Batch orchestration
+# Main entry
 # ----------------------------
-def batch_compare(dirA, dirB, out_dir, files=None):
-    os.makedirs(out_dir, exist_ok=True)
-    files_a = sorted([f for f in os.listdir(dirA) if f.lower().endswith(".pdf")])
-    files_b_set = set([f for f in os.listdir(dirB) if f.lower().endswith(".pdf")])
-    index_entries = []
-    for fname in files_a:
-        if files and fname not in files:
-            continue
-        if fname not in files_b_set:
-            logger.warning("Skipping %s: not present in dirB", fname)
-            continue
-        path_a = os.path.join(dirA, fname)
-        path_b = os.path.join(dirB, fname)
-        try:
-            parsed_a = parse_pdf_layout(path_a)
-            parsed_b = parse_pdf_layout(path_b)
-            diffs = compare_parsed(parsed_a, parsed_b)
-            report_name = fname.rsplit(".",1)[0] + "_comparison.html"
-            out_path = os.path.join(out_dir, report_name)
-            # Convert raw_pages into readable string for report snapshot (small)
-            # we will set parsed.raw_pages to a small printable string to avoid huge HTML
-            parsed_a = parsed_a._replace(raw_pages=str([(p["rows"][0]["text"] if p["rows"] else "") for p in parsed_a.raw_pages]) if parsed_a.raw_pages else "")
-            parsed_b = parsed_b._replace(raw_pages=str([(p["rows"][0]["text"] if p["rows"] else "") for p in parsed_b.raw_pages]) if parsed_b.raw_pages else "")
-            generate_html(parsed_a, parsed_b, diffs, out_path)
-            index_entries.append({"file": fname, "report": report_name, "score": diffs.get("match_score", 0)})
-        except Exception as e:
-            logger.exception("Failed to compare %s: %s", fname, e)
 
-    # index
-    index_path = os.path.join(out_dir, "index.html")
-    with open(index_path, "w", encoding="utf-8") as ix:
-        ix.write("<html><head><meta charset='utf-8'><title>BT Compare Index</title></head><body>")
-        ix.write(f"<h1>BT Bill Comparison Index</h1><p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
-        ix.write("<table border='1' cellpadding='6'><tr><th>File</th><th>Report</th><th>Score</th></tr>")
-        for e in sorted(index_entries, key=lambda x: x['score']):
-            ix.write(f"<tr><td>{e['file']}</td><td><a href='{e['report']}'>{e['report']}</a></td><td>{e['score']}%</td></tr>")
-        ix.write("</table></body></html>")
-    logger.info("Wrote index: %s", index_path)
+def parse_pdf(pdf_path):
+    pages = extract_text_blocks(pdf_path)
+    page1 = pages[0] if pages else ""
+    billing_address = extract_billing_address(page1)
+    account_number = extract_account_number(page1)
+    line_items = extract_line_items(pages)
+    return {
+        "billing_address": billing_address,
+        "account_number": account_number,
+        "line_items": line_items
+    }
 
-# ----------------------------
-# CLI
-# ----------------------------
-def main():
-    parser = argparse.ArgumentParser(description="BT Bill comparator - final")
-    parser.add_argument("--dirA", required=True, help="Folder A (source)")
-    parser.add_argument("--dirB", required=True, help="Folder B (target)")
-    parser.add_argument("--out", required=True, help="Output folder for HTML reports")
-    parser.add_argument("--files", nargs="*", help="Optional list of specific filenames")
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-    if not os.path.isdir(args.dirA) or not os.path.isdir(args.dirB):
-        logger.error("dirA and dirB must be valid directories")
-        sys.exit(1)
-    batch_compare(args.dirA, args.dirB, args.out, files=args.files)
+
+def main(file_a, file_b, output_html="bt_bill_comparison_report.html"):
+    parsed_a = parse_pdf(file_a)
+    parsed_b = parse_pdf(file_b)
+    diffs = compare_dicts(parsed_a["line_items"], parsed_b["line_items"])
+    generate_html(parsed_a, parsed_b, diffs, output_html)
+
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare BT Bill PDFs and generate HTML report.")
+    parser.add_argument("file_a", help="Path to first BT Bill PDF")
+    parser.add_argument("file_b", help="Path to second BT Bill PDF")
+    parser.add_argument("--out", default="bt_bill_comparison_report.html", help="Output HTML file name")
+    args = parser.parse_args()
+    main(args.file_a, args.file_b, args.out)
