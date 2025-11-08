@@ -859,8 +859,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </tr>
                 </thead>
                 <tbody>
-                    {# Safe iteration without .items #}
-                    {% for key in diffs.items.keys() %}
+                    {# FIXED: Use explicit iteration without .keys #}
+                    {% for key in diffs.items %}
                     {% set item = diffs.items[key] %}
                     <tr>
                         <td><strong>{{ key }}</strong></td>
@@ -908,7 +908,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for key in diffs.vat_summary.keys() %}
+                    {# FIXED: Use explicit iteration without .keys #}
+                    {% for key in diffs.vat_summary %}
                     {% set vat_item = diffs.vat_summary[key] %}
                     <tr>
                         <td>{{ key }}</td>
@@ -986,9 +987,8 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
         # Convert ALL nested dictionaries to ensure they're plain dicts
         differences_clean = {}
         for key, value in differences.items():
-            if hasattr(value, 'items') and callable(value.items):
-                # This is a dictionary-like object, convert to plain dict
-                differences_clean[key] = dict(value.items())
+            if isinstance(value, dict):
+                differences_clean[key] = dict(value)
             else:
                 differences_clean[key] = value
         
