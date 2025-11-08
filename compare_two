@@ -57,28 +57,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bt-bill-compare-production")
 
-# Patterns for text extraction and filtering
-AMOUNT_RE = re.compile(r"-?£?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)")
+AMOUNT_RE = re.compile(r"£?\s*-?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)")
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 DATE_RE = re.compile(r"\b(?:\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|\d{1,2}/\d{1,2}/\d{2,4})\b", re.I)
 ACCOUNT_TOKEN_RE = re.compile(r"(VP\s*\d{4}\s*\d{4}|GP\s*\d{4}\s*\d{4}|[A-Z]{1,3}\s*\d{2,6})", re.I)
 
+
 # Section keywords for category detection
 SECTION_KEYWORDS = {
-    "regular_charges": ["regular charges", "regular charge", "regular charges -"],
-    "one_off": ["one-off charges and credits", "one off charges and credits", "one-off charges", "one off charges"],
-    "discounts": ["discounts", "discounts and credits"],
-    "vat_summary": ["vat summary", "your vat summary", "total vat", "vat at"],
-    "charges_detail": ["your charges in detail", "charges for", "usage charges"],
-    "overview": ["total for this bill", "total owed on this account", "this bill"]
+    "regular_charges": [
+        "regular charges", "regular charge", "regular charges -",
+        "bundled services", "charges for bundle", "phone services",
+        "charges for your", "s fibre", "sogea"
+    ],
+    "one_off": [
+        "one-off charges and credits", "one off charges and credits", 
+        "one-off charges", "one off charges", "one-off",
+        "bt cloud voice service connection", "bt cloud voice user set-up",
+        "bt cloud voice cpe delivery"
+    ],
+    "discounts": [
+        "discounts", "discounts and credits", "discount",
+        "loyalty", "credit in advance", "ret loyalty"
+    ],
+    "usage_charges": [
+        "usage charges", "chargeable usage"
+    ],
+    "vat_summary": [
+        "vat summary", "your vat summary", "total vat", "vat at",
+        "vat calculation", "items where vat is charged"
+    ],
+    "charges_detail": [
+        "your charges in detail", "charges for", "charges in detail"
+    ],
+    "overview": [
+        "total for this bill", "total owed on this account", "this bill",
+        "total which includes", "total", "totals"
+    ]
 }
+
 
 # Informational phrases to ignore
 INFO_PHRASES = [
     "these figures exclude", "your offer ends on", "there was no chargeable usage",
     "vat at", "total vat", "total for items where vat", "billing address", 
     "account number", "total owed", "total for this bill", "bill date",
-    "payment due", "your bill summary", "see page", "continued overleaf"
+    "payment due", "your bill summary", "see page", "continued overleaf",
+    "bt order ref", "your order ref", "this is the", "this is your",
+    "vat calculation", "items where vat is charged", "vat summary",
+    "your vat summary", "total which includes", "amount vat rate",
+    "order ref", "your ref", "this is"
 ]
 
 ParsedBill = namedtuple("ParsedBill", [
