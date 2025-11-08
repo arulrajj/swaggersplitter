@@ -912,13 +912,26 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
     try:
         template = Template(HTML_TEMPLATE)
         
-        # Prepare bill data for reporting
-        bill_a_report = bill_a._replace(
-            raw_pages=str([page.get('spans', [])[:3] for page in bill_a.raw_pages[:2]]) if bill_a.raw_pages else ""
-        )
-        bill_b_report = bill_b._replace(
-            raw_pages=str([page.get('spans', [])[:3] for page in bill_b.raw_pages[:2]]) if bill_b.raw_pages else ""
-        )
+        # Prepare bill data for reporting - ensure we're passing proper dictionaries
+        bill_a_report = {
+            'file': bill_a.file,
+            'account': bill_a.account,
+            'billing_address': bill_a.billing_address,
+            'subtotal': str(bill_a.subtotal) if bill_a.subtotal else None,
+            'vat': str(bill_a.vat) if bill_a.vat else None,
+            'total': str(bill_a.total) if bill_a.total else None,
+            'raw_pages': str([page.get('spans', [])[:3] for page in bill_a.raw_pages[:2]]) if bill_a.raw_pages else ""
+        }
+        
+        bill_b_report = {
+            'file': bill_b.file,
+            'account': bill_b.account,
+            'billing_address': bill_b.billing_address,
+            'subtotal': str(bill_b.subtotal) if bill_b.subtotal else None,
+            'vat': str(bill_b.vat) if bill_b.vat else None,
+            'total': str(bill_b.total) if bill_b.total else None,
+            'raw_pages': str([page.get('spans', [])[:3] for page in bill_b.raw_pages[:2]]) if bill_b.raw_pages else ""
+        }
         
         rendered_html = template.render(
             a=bill_a_report,
@@ -987,6 +1000,9 @@ def process_batch_comparison(dir_a: str, dir_b: str, output_dir: str,
             
         except Exception as e:
             logger.error(f"Failed to process {pdf_file}: {e}")
+            # Add detailed traceback for debugging
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             continue
     
     # Generate index page
