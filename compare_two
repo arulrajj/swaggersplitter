@@ -859,7 +859,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for key, item in diffs.items.items() %}
+                    {# Safe iteration without .items #}
+                    {% for key in diffs.items.keys() %}
+                    {% set item = diffs.items[key] %}
                     <tr>
                         <td><strong>{{ key }}</strong></td>
                         <td>{{ item.example_a or item.example_b or '—' }}</td>
@@ -906,7 +908,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for key, vat_item in diffs.vat_summary.items() %}
+                    {% for key in diffs.vat_summary.keys() %}
+                    {% set vat_item = diffs.vat_summary[key] %}
                     <tr>
                         <td>{{ key }}</td>
                         <td>{{ vat_item.a or '—' }}</td>
@@ -932,6 +935,33 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
                              differences: Dict[str, Any], output_path: str) -> None:
     """Generate HTML comparison report"""
     try:
+        # DEBUG: Check the structure before template rendering
+        logger.debug("=== DEBUG: Checking template variables ===")
+        logger.debug(f"Type of differences: {type(differences)}")
+        
+        # Check if differences is a dictionary and has proper items method
+        if hasattr(differences, 'items'):
+            logger.debug("differences has 'items' attribute")
+            if callable(differences.items):
+                logger.debug("differences.items is callable - should use items()")
+                # Test if we can call it
+                try:
+                    items_result = differences.items()
+                    logger.debug(f"differences.items() returned: {type(items_result)} with {len(list(items_result))} items")
+                except Exception as e:
+                    logger.error(f"ERROR calling differences.items(): {e}")
+            else:
+                logger.error("differences.items is NOT callable - this is the problem!")
+        else:
+            logger.error("differences does not have 'items' attribute")
+        
+        # Check each key in differences
+        for key in list(differences.keys())[:5]:  # First 5 keys
+            value = differences[key]
+            logger.debug(f"Key '{key}': type {type(value)}")
+            if key == 'items' and hasattr(value, 'items'):
+                logger.debug(f"  differences['items'] has 'items': {callable(value.items)}")
+        
         template = Template(HTML_TEMPLATE)
         
         # Prepare bill data for reporting
@@ -942,7 +972,6 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
             'subtotal': str(bill_a.subtotal) if bill_a.subtotal else None,
             'vat': str(bill_a.vat) if bill_a.vat else None,
             'total': str(bill_a.total) if bill_a.total else None,
-            'raw_pages': "Raw pages data"  # Simplified for now
         }
         
         bill_b_report = {
@@ -952,37 +981,24 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
             'subtotal': str(bill_b.subtotal) if bill_b.subtotal else None,
             'vat': str(bill_b.vat) if bill_b.vat else None,
             'total': str(bill_b.total) if bill_b.total else None,
-            'raw_pages': "Raw pages data"  # Simplified for now
         }
         
-        # DEBUG: Check the structure of differences
-        logger.debug(f"Type of differences: {type(differences)}")
-        logger.debug(f"Differences keys: {list(differences.keys())}")
-        
-        # Check if differences has any methods that might cause issues
-        problematic_attrs = [attr for attr in dir(differences) if not attr.startswith('_')]
-        logger.debug(f"Non-private attributes in differences: {problematic_attrs}")
-        
-        # Specifically check the items attribute
-        if hasattr(differences, 'items'):
-            logger.debug(f"differences.items type: {type(differences.items)}")
-            if callable(differences.items):
-                logger.debug("differences.items is callable - should use items()")
+        # Convert ALL nested dictionaries to ensure they're plain dicts
+        differences_clean = {}
+        for key, value in differences.items():
+            if hasattr(value, 'items') and callable(value.items):
+                # This is a dictionary-like object, convert to plain dict
+                differences_clean[key] = dict(value.items())
             else:
-                logger.debug("differences.items is not callable - this is the problem!")
+                differences_clean[key] = value
         
-        # Convert differences to a plain dictionary to avoid any method conflicts
-        differences_dict = {}
-        for key, value in differences.items():  # Use items() method call
-            differences_dict[key] = value
-        
-        logger.debug(f"Converted differences_dict type: {type(differences_dict)}")
-        logger.debug(f"Converted differences_dict keys: {list(differences_dict.keys())}")
+        logger.debug("=== DEBUG: After cleaning differences ===")
+        logger.debug(f"Cleaned differences type: {type(differences_clean)}")
         
         rendered_html = template.render(
             a=bill_a_report,
             b=bill_b_report,
-            diffs=differences_dict,  # Use the converted dictionary
+            diffs=differences_clean,
             now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
         
@@ -990,12 +1006,12 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
             f.write(rendered_html)
         
         logger.info(f"Generated comparison report: {output_path}")
+        
     except Exception as e:
         logger.error(f"Failed to generate report {output_path}: {e}")
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         raise
-
 # ----------------------------
 # Batch Processing
 # ----------------------------
