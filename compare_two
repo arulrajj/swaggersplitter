@@ -624,8 +624,8 @@ def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Deci
         "status": "OK" if amounts_equal(bill_a.total, bill_b.total) else "DIFF"
     }
     
-    # Line item comparison - ensure we use items() method
-    all_keys = sorted(set(list(bill_a.items.keys())) | set(list(bill_b.items.keys())))
+    # FIXED: Line item comparison - proper set union
+    all_keys = sorted(set(bill_a.items.keys()) | set(bill_b.items.keys()))
     items_comparison = {}
     
     for key in all_keys:
@@ -662,9 +662,10 @@ def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Deci
     
     differences["items"] = items_comparison
     
-    # VAT summary comparison
+    # FIXED: VAT summary comparison - proper set union
+    vat_keys = set(bill_a.vat_summary.keys()) | set(bill_b.vat_summary.keys())
     vat_summary_comparison = {}
-    vat_keys = set(list(bill_a.vat_summary.keys()) | set(list(bill_b.vat_summary.keys())))
+    
     for key in vat_keys:
         va = bill_a.vat_summary.get(key)
         vb = bill_b.vat_summary.get(key)
@@ -673,6 +674,7 @@ def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Deci
             "b": str(vb) if vb else None,
             "equal": amounts_equal(va, vb)
         }
+    
     differences["vat_summary"] = vat_summary_comparison
     
     # Calculate overall match score
@@ -682,7 +684,7 @@ def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Deci
     differences["match_score"] = match_score
     
     # Ensure we return a plain dictionary
-    return dict(differences)  # Convert to plain dict
+    return dict(differences)
 
 # ----------------------------
 # HTML Reporting
