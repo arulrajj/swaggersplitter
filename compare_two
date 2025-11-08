@@ -586,40 +586,46 @@ def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Deci
         except (InvalidOperation, TypeError):
             return False
     
-    differences = {
-        "account": {
-            "a": bill_a.account, "b": bill_b.account, 
-            "equal": bill_a.account == bill_b.account,
-            "status": "OK" if bill_a.account == bill_b.account else "DIFF"
-        },
-        "address": {
-            "a": bill_a.billing_address, "b": bill_b.billing_address,
-            "similarity": similar(bill_a.billing_address or "", bill_b.billing_address or ""),
-            "equal": similar(bill_a.billing_address or "", bill_b.billing_address or "") >= 90,
-            "status": "OK" if similar(bill_a.billing_address or "", bill_b.billing_address or "") >= 90 else "DIFF"
-        },
-        "subtotal": {
-            "a": str(bill_a.subtotal) if bill_a.subtotal else None,
-            "b": str(bill_b.subtotal) if bill_b.subtotal else None,
-            "equal": amounts_equal(bill_a.subtotal, bill_b.subtotal),
-            "status": "OK" if amounts_equal(bill_a.subtotal, bill_b.subtotal) else "DIFF"
-        },
-        "vat": {
-            "a": str(bill_a.vat) if bill_a.vat else None,
-            "b": str(bill_b.vat) if bill_b.vat else None,
-            "equal": amounts_equal(bill_a.vat, bill_b.vat),
-            "status": "OK" if amounts_equal(bill_a.vat, bill_b.vat) else "DIFF"
-        },
-        "total": {
-            "a": str(bill_a.total) if bill_a.total else None,
-            "b": str(bill_b.total) if bill_b.total else None,
-            "equal": amounts_equal(bill_a.total, bill_b.total),
-            "status": "OK" if amounts_equal(bill_a.total, bill_b.total) else "DIFF"
-        }
+    # Initialize differences as a plain dictionary
+    differences = {}
+    
+    differences["account"] = {
+        "a": bill_a.account, "b": bill_b.account, 
+        "equal": bill_a.account == bill_b.account,
+        "status": "OK" if bill_a.account == bill_b.account else "DIFF"
     }
     
-    # Line item comparison
-    all_keys = sorted(set(bill_a.items.keys()) | set(bill_b.items.keys()))
+    address_similarity = similar(bill_a.billing_address or "", bill_b.billing_address or "")
+    differences["address"] = {
+        "a": bill_a.billing_address, "b": bill_b.billing_address,
+        "similarity": address_similarity,
+        "equal": address_similarity >= 90,
+        "status": "OK" if address_similarity >= 90 else "DIFF"
+    }
+    
+    differences["subtotal"] = {
+        "a": str(bill_a.subtotal) if bill_a.subtotal else None,
+        "b": str(bill_b.subtotal) if bill_b.subtotal else None,
+        "equal": amounts_equal(bill_a.subtotal, bill_b.subtotal),
+        "status": "OK" if amounts_equal(bill_a.subtotal, bill_b.subtotal) else "DIFF"
+    }
+    
+    differences["vat"] = {
+        "a": str(bill_a.vat) if bill_a.vat else None,
+        "b": str(bill_b.vat) if bill_b.vat else None,
+        "equal": amounts_equal(bill_a.vat, bill_b.vat),
+        "status": "OK" if amounts_equal(bill_a.vat, bill_b.vat) else "DIFF"
+    }
+    
+    differences["total"] = {
+        "a": str(bill_a.total) if bill_a.total else None,
+        "b": str(bill_b.total) if bill_b.total else None,
+        "equal": amounts_equal(bill_a.total, bill_b.total),
+        "status": "OK" if amounts_equal(bill_a.total, bill_b.total) else "DIFF"
+    }
+    
+    # Line item comparison - ensure we use items() method
+    all_keys = sorted(set(list(bill_a.items.keys())) | set(list(bill_b.items.keys())))
     items_comparison = {}
     
     for key in all_keys:
@@ -656,13 +662,27 @@ def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Deci
     
     differences["items"] = items_comparison
     
+    # VAT summary comparison
+    vat_summary_comparison = {}
+    vat_keys = set(list(bill_a.vat_summary.keys()) | set(list(bill_b.vat_summary.keys())))
+    for key in vat_keys:
+        va = bill_a.vat_summary.get(key)
+        vb = bill_b.vat_summary.get(key)
+        vat_summary_comparison[key] = {
+            "a": str(va) if va else None,
+            "b": str(vb) if vb else None,
+            "equal": amounts_equal(va, vb)
+        }
+    differences["vat_summary"] = vat_summary_comparison
+    
     # Calculate overall match score
     top_level_checks = ["account", "address", "subtotal", "vat", "total"]
     matching_checks = sum(1 for check in top_level_checks if differences[check]["equal"])
     match_score = round((matching_checks / len(top_level_checks)) * 100, 1)
     differences["match_score"] = match_score
     
-    return differences
+    # Ensure we return a plain dictionary
+    return dict(differences)  # Convert to plain dict
 
 # ----------------------------
 # HTML Reporting
@@ -912,7 +932,7 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
     try:
         template = Template(HTML_TEMPLATE)
         
-        # Prepare bill data for reporting - ensure we're passing proper dictionaries
+        # Prepare bill data for reporting
         bill_a_report = {
             'file': bill_a.file,
             'account': bill_a.account,
@@ -920,7 +940,7 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
             'subtotal': str(bill_a.subtotal) if bill_a.subtotal else None,
             'vat': str(bill_a.vat) if bill_a.vat else None,
             'total': str(bill_a.total) if bill_a.total else None,
-            'raw_pages': str([page.get('spans', [])[:3] for page in bill_a.raw_pages[:2]]) if bill_a.raw_pages else ""
+            'raw_pages': "Raw pages data"  # Simplified for now
         }
         
         bill_b_report = {
@@ -930,13 +950,37 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
             'subtotal': str(bill_b.subtotal) if bill_b.subtotal else None,
             'vat': str(bill_b.vat) if bill_b.vat else None,
             'total': str(bill_b.total) if bill_b.total else None,
-            'raw_pages': str([page.get('spans', [])[:3] for page in bill_b.raw_pages[:2]]) if bill_b.raw_pages else ""
+            'raw_pages': "Raw pages data"  # Simplified for now
         }
+        
+        # DEBUG: Check the structure of differences
+        logger.debug(f"Type of differences: {type(differences)}")
+        logger.debug(f"Differences keys: {list(differences.keys())}")
+        
+        # Check if differences has any methods that might cause issues
+        problematic_attrs = [attr for attr in dir(differences) if not attr.startswith('_')]
+        logger.debug(f"Non-private attributes in differences: {problematic_attrs}")
+        
+        # Specifically check the items attribute
+        if hasattr(differences, 'items'):
+            logger.debug(f"differences.items type: {type(differences.items)}")
+            if callable(differences.items):
+                logger.debug("differences.items is callable - should use items()")
+            else:
+                logger.debug("differences.items is not callable - this is the problem!")
+        
+        # Convert differences to a plain dictionary to avoid any method conflicts
+        differences_dict = {}
+        for key, value in differences.items():  # Use items() method call
+            differences_dict[key] = value
+        
+        logger.debug(f"Converted differences_dict type: {type(differences_dict)}")
+        logger.debug(f"Converted differences_dict keys: {list(differences_dict.keys())}")
         
         rendered_html = template.render(
             a=bill_a_report,
             b=bill_b_report,
-            diffs=differences,
+            diffs=differences_dict,  # Use the converted dictionary
             now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
         
@@ -946,6 +990,8 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
         logger.info(f"Generated comparison report: {output_path}")
     except Exception as e:
         logger.error(f"Failed to generate report {output_path}: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise
 
 # ----------------------------
