@@ -719,7 +719,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .timestamp { color: #6c757d; font-size: 0.9em; margin-bottom: 20px; }
         .file-info { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px; margin: 15px 0; }
         .file-card { flex: 1; min-width: 300px; background: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #0047ab; }
-        pre { background: #f8f9fa; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; margin: 10px 0; }
     </style>
 </head>
 <body>
@@ -753,6 +752,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- Basic comparisons (non-iterative) -->
         <div class="section">
             <h2>Account & Billing Address Comparison</h2>
             <table>
@@ -845,6 +845,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </table>
         </div>
 
+        <!-- Line Items with SAFE iteration -->
         <div class="section">
             <h2>Line Item Comparison</h2>
             <table>
@@ -859,42 +860,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </tr>
                 </thead>
                 <tbody>
-                    {# FIXED: Use explicit iteration without .keys #}
-                    {% for key in diffs.items %}
-                    {% set item = diffs.items[key] %}
-                    <tr>
-                        <td><strong>{{ key }}</strong></td>
-                        <td>{{ item.example_a or item.example_b or '—' }}</td>
-                        <td>{{ item.a_amount or '—' }}</td>
-                        <td>{{ item.b_amount or '—' }}</td>
-                        <td>
-                            {% if item.delta %}
-                                {% if item.delta.startswith('-') %}
-                                <span class="delta-negative">{{ item.delta }}</span>
+                    {% if diffs.items %}
+                        {% for key, item in diffs.items.items() %}
+                        <tr>
+                            <td><strong>{{ key }}</strong></td>
+                            <td>{{ item.example_a or item.example_b or '—' }}</td>
+                            <td>{{ item.a_amount or '—' }}</td>
+                            <td>{{ item.b_amount or '—' }}</td>
+                            <td>
+                                {% if item.delta %}
+                                    {% if item.delta.startswith('-') %}
+                                    <span class="delta-negative">{{ item.delta }}</span>
+                                    {% else %}
+                                    <span class="delta-positive">+{{ item.delta }}</span>
+                                    {% endif %}
                                 {% else %}
-                                <span class="delta-positive">+{{ item.delta }}</span>
+                                    —
                                 {% endif %}
-                            {% else %}
-                                —
-                            {% endif %}
-                        </td>
-                        <td>
-                            {% if item.status == 'OK' %}
-                            <span class="status-ok">OK</span>
-                            {% elif item.status == 'DIFF' %}
-                            <span class="status-diff">DIFF</span>
-                            {% elif 'Missing' in item.status %}
-                            <span class="status-missing">{{ item.status }}</span>
-                            {% else %}
-                            <span class="status-missing">{{ item.status }}</span>
-                            {% endif %}
-                        </td>
-                    </tr>
-                    {% endfor %}
+                            </td>
+                            <td>
+                                {% if item.status == 'OK' %}
+                                <span class="status-ok">OK</span>
+                                {% elif item.status == 'DIFF' %}
+                                <span class="status-diff">DIFF</span>
+                                {% elif 'Missing' in item.status %}
+                                <span class="status-missing">{{ item.status }}</span>
+                                {% else %}
+                                <span class="status-missing">{{ item.status }}</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    {% else %}
+                        <tr>
+                            <td colspan="6" style="text-align: center;">No line items found</td>
+                        </tr>
+                    {% endif %}
                 </tbody>
             </table>
         </div>
 
+        <!-- VAT Summary with SAFE iteration -->
         {% if diffs.vat_summary %}
         <div class="section">
             <h2>VAT Summary</h2>
@@ -908,9 +914,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </tr>
                 </thead>
                 <tbody>
-                    {# FIXED: Use explicit iteration without .keys #}
-                    {% for key in diffs.vat_summary %}
-                    {% set vat_item = diffs.vat_summary[key] %}
+                    {% for key, vat_item in diffs.vat_summary.items() %}
                     <tr>
                         <td>{{ key }}</td>
                         <td>{{ vat_item.a or '—' }}</td>
@@ -936,33 +940,6 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
                              differences: Dict[str, Any], output_path: str) -> None:
     """Generate HTML comparison report"""
     try:
-        # DEBUG: Check the structure before template rendering
-        logger.debug("=== DEBUG: Checking template variables ===")
-        logger.debug(f"Type of differences: {type(differences)}")
-        
-        # Check if differences is a dictionary and has proper items method
-        if hasattr(differences, 'items'):
-            logger.debug("differences has 'items' attribute")
-            if callable(differences.items):
-                logger.debug("differences.items is callable - should use items()")
-                # Test if we can call it
-                try:
-                    items_result = differences.items()
-                    logger.debug(f"differences.items() returned: {type(items_result)} with {len(list(items_result))} items")
-                except Exception as e:
-                    logger.error(f"ERROR calling differences.items(): {e}")
-            else:
-                logger.error("differences.items is NOT callable - this is the problem!")
-        else:
-            logger.error("differences does not have 'items' attribute")
-        
-        # Check each key in differences
-        for key in list(differences.keys())[:5]:  # First 5 keys
-            value = differences[key]
-            logger.debug(f"Key '{key}': type {type(value)}")
-            if key == 'items' and hasattr(value, 'items'):
-                logger.debug(f"  differences['items'] has 'items': {callable(value.items)}")
-        
         template = Template(HTML_TEMPLATE)
         
         # Prepare bill data for reporting
@@ -984,16 +961,50 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
             'total': str(bill_b.total) if bill_b.total else None,
         }
         
-        # Convert ALL nested dictionaries to ensure they're plain dicts
-        differences_clean = {}
-        for key, value in differences.items():
-            if isinstance(value, dict):
-                differences_clean[key] = dict(value)
-            else:
-                differences_clean[key] = value
+        # COMPLETELY SAFE: Convert everything to basic types and ensure iterables
+        differences_clean = {
+            'match_score': differences.get('match_score', 0)
+        }
         
-        logger.debug("=== DEBUG: After cleaning differences ===")
-        logger.debug(f"Cleaned differences type: {type(differences_clean)}")
+        # Convert all nested structures
+        for key in ['account', 'address', 'subtotal', 'vat', 'total']:
+            if key in differences:
+                differences_clean[key] = dict(differences[key])
+        
+        # Safely handle items - ensure it's a proper dictionary
+        if 'items' in differences:
+            items_clean = {}
+            items_data = differences['items']
+            # Convert to proper dict if needed
+            if hasattr(items_data, 'items') and callable(items_data.items):
+                items_data = dict(items_data.items())
+            
+            for item_key, item_value in items_data.items():
+                items_clean[item_key] = dict(item_value) if isinstance(item_value, dict) else item_value
+            differences_clean['items'] = items_clean
+        
+        # Safely handle vat_summary
+        if 'vat_summary' in differences:
+            vat_clean = {}
+            vat_data = differences['vat_summary']
+            # Convert to proper dict if needed
+            if hasattr(vat_data, 'items') and callable(vat_data.items):
+                vat_data = dict(vat_data.items())
+            
+            for vat_key, vat_value in vat_data.items():
+                vat_clean[vat_key] = dict(vat_value) if isinstance(vat_value, dict) else vat_value
+            differences_clean['vat_summary'] = vat_clean
+        
+        logger.debug("=== FINAL CHECK ===")
+        logger.debug(f"differences_clean type: {type(differences_clean)}")
+        logger.debug(f"differences_clean keys: {list(differences_clean.keys())}")
+        
+        # Verify everything is iterable
+        for key, value in differences_clean.items():
+            logger.debug(f"Key '{key}': type {type(value)}, iterable: {hasattr(value, '__iter__')}")
+            if key in ['items', 'vat_summary'] and value:
+                sample_key = next(iter(value.keys())) if value else "empty"
+                logger.debug(f"  Sample inner key: {sample_key}")
         
         rendered_html = template.render(
             a=bill_a_report,
