@@ -1023,17 +1023,225 @@ def generate_comparison_report(bill_a: ParsedBill, bill_b: ParsedBill,
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         raise
+
+def generate_text_report(bill_a: ParsedBill, bill_b: ParsedBill, 
+                        differences: Dict[str, Any], output_path: str) -> None:
+    """Generate a simple text comparison report"""
+    
+    report_lines = []
+    report_lines.append("=" * 80)
+    report_lines.append(f"BT BILL COMPARISON REPORT")
+    report_lines.append("=" * 80)
+    report_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report_lines.append(f"File A: {bill_a.file}")
+    report_lines.append(f"File B: {bill_b.file}")
+    report_lines.append(f"Match Score: {differences.get('match_score', 0)}%")
+    report_lines.append("")
+    
+    # Account & Address
+    report_lines.append("ACCOUNT & ADDRESS")
+    report_lines.append("-" * 40)
+    report_lines.append(f"Account A: {bill_a.account or 'Not found'}")
+    report_lines.append(f"Account B: {bill_b.account or 'Not found'}")
+    report_lines.append(f"Status: {'OK' if differences['account']['equal'] else 'DIFF'}")
+    report_lines.append("")
+    report_lines.append(f"Address A: {bill_a.billing_address or 'Not found'}")
+    report_lines.append(f"Address B: {bill_b.billing_address or 'Not found'}")
+    report_lines.append(f"Status: {'OK' if differences['address']['equal'] else 'DIFF'}")
+    report_lines.append("")
+    
+    # Summary Totals
+    report_lines.append("SUMMARY TOTALS")
+    report_lines.append("-" * 40)
+    for field in ['subtotal', 'vat', 'total']:
+        diff_data = differences[field]
+        report_lines.append(f"{field.upper()}:")
+        report_lines.append(f"  A: {diff_data['a'] or '—'}")
+        report_lines.append(f"  B: {diff_data['b'] or '—'}")
+        report_lines.append(f"  Status: {'OK' if diff_data['equal'] else 'DIFF'}")
+    report_lines.append("")
+    
+    # Line Items
+    report_lines.append("LINE ITEMS")
+    report_lines.append("-" * 40)
+    if 'items' in differences:
+        items_data = differences['items']
+        for key, item in items_data.items():
+            report_lines.append(f"ITEM: {key}")
+            report_lines.append(f"  Example: {item.get('example_a') or item.get('example_b') or '—'}")
+            report_lines.append(f"  Amount A: {item.get('a_amount') or '—'}")
+            report_lines.append(f"  Amount B: {item.get('b_amount') or '—'}")
+            report_lines.append(f"  Delta: {item.get('delta') or '—'}")
+            report_lines.append(f"  Status: {item.get('status', 'UNKNOWN')}")
+            report_lines.append("")
+    else:
+        report_lines.append("No line items found")
+        report_lines.append("")
+    
+    # VAT Summary
+    if 'vat_summary' in differences and differences['vat_summary']:
+        report_lines.append("VAT SUMMARY")
+        report_lines.append("-" * 40)
+        for key, vat_item in differences['vat_summary'].items():
+            report_lines.append(f"{key}:")
+            report_lines.append(f"  A: {vat_item.get('a') or '—'}")
+            report_lines.append(f"  B: {vat_item.get('b') or '—'}")
+            report_lines.append(f"  Status: {'OK' if vat_item.get('equal') else 'DIFF'}")
+        report_lines.append("")
+    
+    # Write to file
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(report_lines))
+    
+    logger.info(f"Generated text report: {output_path}")
+
+
+import csv
+
+def generate_csv_report(bill_a: ParsedBill, bill_b: ParsedBill, 
+                       differences: Dict[str, Any], output_path: str) -> None:
+    """Generate CSV comparison report"""
+    
+    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Header
+        writer.writerow(["BT Bill Comparison Report"])
+        writer.writerow([f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+        writer.writerow([f"File A: {bill_a.file}"])
+        writer.writerow([f"File B: {bill_b.file}"])
+        writer.writerow([f"Match Score: {differences.get('match_score', 0)}%"])
+        writer.writerow([])
+        
+        # Account & Address
+        writer.writerow(["ACCOUNT & ADDRESS"])
+        writer.writerow(["Field", "Bill A", "Bill B", "Status"])
+        writer.writerow([
+            "Account", 
+            bill_a.account or "Not found", 
+            bill_b.account or "Not found", 
+            "OK" if differences['account']['equal'] else "DIFF"
+        ])
+        writer.writerow([
+            "Address", 
+            bill_a.billing_address or "Not found", 
+            bill_b.billing_address or "Not found", 
+            "OK" if differences['address']['equal'] else "DIFF"
+        ])
+        writer.writerow([])
+        
+        # Summary Totals
+        writer.writerow(["SUMMARY TOTALS"])
+        writer.writerow(["Metric", "Bill A", "Bill B", "Status"])
+        for field in ['subtotal', 'vat', 'total']:
+            diff_data = differences[field]
+            writer.writerow([
+                field.upper(),
+                diff_data['a'] or "—",
+                diff_data['b'] or "—", 
+                "OK" if diff_data['equal'] else "DIFF"
+            ])
+        writer.writerow([])
+        
+        # Line Items
+        writer.writerow(["LINE ITEMS"])
+        writer.writerow(["Category & Description", "Example", "Amount A", "Amount B", "Delta", "Status"])
+        if 'items' in differences:
+            items_data = differences['items']
+            for key, item in items_data.items():
+                writer.writerow([
+                    key,
+                    item.get('example_a') or item.get('example_b') or "—",
+                    item.get('a_amount') or "—",
+                    item.get('b_amount') or "—",
+                    item.get('delta') or "—",
+                    item.get('status', 'UNKNOWN')
+                ])
+        else:
+            writer.writerow(["No line items found", "", "", "", "", ""])
+        writer.writerow([])
+        
+        # VAT Summary
+        if 'vat_summary' in differences and differences['vat_summary']:
+            writer.writerow(["VAT SUMMARY"])
+            writer.writerow(["Item", "Bill A", "Bill B", "Status"])
+            for key, vat_item in differences['vat_summary'].items():
+                writer.writerow([
+                    key,
+                    vat_item.get('a') or "—",
+                    vat_item.get('b') or "—",
+                    "OK" if vat_item.get('equal') else "DIFF"
+                ])
+    
+    logger.info(f"Generated CSV report: {output_path}")
+
+
+import json
+
+def generate_json_report(bill_a: ParsedBill, bill_b: ParsedBill, 
+                        differences: Dict[str, Any], output_path: str) -> None:
+    """Generate JSON comparison report - most reliable option"""
+    
+    report_data = {
+        "metadata": {
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "file_a": bill_a.file,
+            "file_b": bill_b.file,
+            "match_score": differences.get('match_score', 0)
+        },
+        "account_comparison": {
+            "account_a": bill_a.account,
+            "account_b": bill_b.account,
+            "equal": differences['account']['equal'],
+            "status": "OK" if differences['account']['equal'] else "DIFF"
+        },
+        "address_comparison": {
+            "address_a": bill_a.billing_address,
+            "address_b": bill_b.billing_address,
+            "similarity": differences['address']['similarity'],
+            "equal": differences['address']['equal'],
+            "status": "OK" if differences['address']['equal'] else "DIFF"
+        },
+        "totals_comparison": {},
+        "line_items": {},
+        "vat_summary": {}
+    }
+    
+    # Add totals
+    for field in ['subtotal', 'vat', 'total']:
+        diff_data = differences[field]
+        report_data["totals_comparison"][field] = {
+            "amount_a": diff_data['a'],
+            "amount_b": diff_data['b'],
+            "equal": diff_data['equal'],
+            "status": "OK" if diff_data['equal'] else "DIFF"
+        }
+    
+    # Add line items
+    if 'items' in differences:
+        report_data["line_items"] = differences['items']
+    
+    # Add VAT summary
+    if 'vat_summary' in differences:
+        report_data["vat_summary"] = differences['vat_summary']
+    
+    # Write JSON file
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(report_data, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"Generated JSON report: {output_path}")
+
+
+
 # ----------------------------
 # Batch Processing
 # ----------------------------
 def process_batch_comparison(dir_a: str, dir_b: str, output_dir: str, 
-                           specific_files: Optional[List[str]] = None) -> None:
-    """Process batch comparison of PDF files in two directories"""
+                           specific_files: Optional[List[str]] = None,
+                           report_format: str = "json") -> None:
+    """Process batch comparison with configurable report format"""
     
-    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Get PDF files from directory A
     pdf_files_a = [f for f in os.listdir(dir_a) if f.lower().endswith('.pdf')]
     pdf_files_b_set = set([f for f in os.listdir(dir_b) if f.lower().endswith('.pdf')])
     
@@ -1050,23 +1258,29 @@ def process_batch_comparison(dir_a: str, dir_b: str, output_dir: str,
         try:
             logger.info(f"Processing: {pdf_file}")
             
-            # Parse both bills
             bill_a_path = os.path.join(dir_a, pdf_file)
             bill_b_path = os.path.join(dir_b, pdf_file)
             
             bill_a = parse_pdf_bill(bill_a_path)
             bill_b = parse_pdf_bill(bill_b_path)
-            
-            # Compare bills
             differences = compare_bills(bill_a, bill_b)
             
-            # Generate report
-            report_name = f"{os.path.splitext(pdf_file)[0]}_comparison.html"
-            report_path = os.path.join(output_dir, report_name)
+            # Generate report based on format
+            base_name = os.path.splitext(pdf_file)[0]
             
-            generate_comparison_report(bill_a, bill_b, differences, report_path)
+            if report_format == "text":
+                report_name = f"{base_name}_comparison.txt"
+                report_path = os.path.join(output_dir, report_name)
+                generate_text_report(bill_a, bill_b, differences, report_path)
+            elif report_format == "csv":
+                report_name = f"{base_name}_comparison.csv"
+                report_path = os.path.join(output_dir, report_name)
+                generate_csv_report(bill_a, bill_b, differences, report_path)
+            else:  # Default to JSON
+                report_name = f"{base_name}_comparison.json"
+                report_path = os.path.join(output_dir, report_name)
+                generate_json_report(bill_a, bill_b, differences, report_path)
             
-            # Add to index
             index_entries.append({
                 'file': pdf_file,
                 'report': report_name,
@@ -1075,13 +1289,9 @@ def process_batch_comparison(dir_a: str, dir_b: str, output_dir: str,
             
         except Exception as e:
             logger.error(f"Failed to process {pdf_file}: {e}")
-            # Add detailed traceback for debugging
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
             continue
     
-    # Generate index page
-    generate_index_page(index_entries, output_dir)
+    generate_index_page(index_entries, output_dir, report_format)
 
 def generate_index_page(entries: List[Dict], output_dir: str) -> None:
     """Generate index page with links to all comparison reports"""
