@@ -500,22 +500,22 @@ def detect_section_for_text(text: str) -> Optional[str]:
 
 def extract_amount_from_row(row: Dict, page_width: float, sidebar_threshold: float) -> Optional[str]:
     """
-    Extract monetary amount from a row, avoiding dates and sidebar numbers
+    Enhanced amount extraction with better right-side detection
     """
-    # Prioritize spans in the right portion of main content area
-    right_area_spans = [
+    # Prioritize spans in the far right area (likely amounts)
+    rightmost_spans = [
         span for span in row["spans"] 
-        if (span["x0"] + span["x1"]) / 2.0 > page_width * 0.5 
-        and span["x1"] < sidebar_threshold
+        if span["x1"] > page_width * 0.7 and span["x1"] < sidebar_threshold
     ]
     
-    # Check right-area spans first
-    for span in right_area_spans:
+    # Check rightmost spans first
+    for span in sorted(rightmost_spans, key=lambda s: s["x1"], reverse=True):
         amount_match = AMOUNT_RE.search(span["text"])
         if amount_match:
             amount_text = amount_match.group(1)
             # Filter out dates and years
             if not (YEAR_RE.search(amount_text) or DATE_RE.search(span["text"])):
+                logger.debug(f"Found amount in rightmost span: {amount_text} from '{span['text']}'")
                 return amount_text
     
     # Fallback: check all spans in main content area
@@ -527,6 +527,7 @@ def extract_amount_from_row(row: Dict, page_width: float, sidebar_threshold: flo
         if amount_match:
             amount_text = amount_match.group(1)
             if not (YEAR_RE.search(amount_text) or DATE_RE.search(span["text"])):
+                logger.debug(f"Found amount in main span: {amount_text} from '{span['text']}'")
                 return amount_text
     
     return None
@@ -548,12 +549,7 @@ def normalize_line_description(text: str) -> str:
 
 def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
     """
-    Parse line items with strict category separation
-    
-    Returns:
-        items_dict: {(section, normalized_desc): {amount, example, page}}
-        vat_summary: VAT-related amounts
-        subtotal, vat, total: main totals
+    Parse line items with proper totals and VAT extraction
     """
     items = {}
     current_section = None
@@ -580,7 +576,55 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
             if is_informational_text(text):
                 continue
             
-            # Extract amount
+            # SPECIAL HANDLING: Extract totals and VAT from specific patterns
+            text_lower = text.lower()
+            
+            # Extract Total (most important)
+            if any(phrase in text_lower for phrase in [
+                "total for this bill", "total owed", "total including vat", 
+                "total amount", "bill total", "total payable"
+            ]):
+                amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
+                if amount_text:
+                    total = norm_amount_str(amount_text)
+                    vat_summary["total_for_bill"] = total
+                    logger.info(f"Found Total: {total} in text: {text}")
+                continue
+            
+            # Extract Subtotal (total excluding VAT)
+            if any(phrase in text_lower for phrase in [
+                "total excluding vat", "subtotal", "net total", "total before vat"
+            ]):
+                amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
+                if amount_text:
+                    subtotal = norm_amount_str(amount_text)
+                    vat_summary["total_excluding_vat"] = subtotal
+                    logger.info(f"Found Subtotal: {subtotal} in text: {text}")
+                continue
+            
+            # Extract VAT amount
+            if any(phrase in text_lower for phrase in [
+                "vat at", "total vat", "vat amount", "vat charged"
+            ]) and "vat summary" not in text_lower:
+                amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
+                if amount_text:
+                    vat = norm_amount_str(amount_text)
+                    vat_summary["total_vat"] = vat
+                    logger.info(f"Found VAT: {vat} in text: {text}")
+                continue
+            
+            # Extract VAT summary details
+            if "vat summary" in text_lower or "vat calculation" in text_lower:
+                # Look for VAT rate details in subsequent rows
+                for next_row in rows[rows.index(row) + 1:rows.index(row) + 5]:
+                    next_text = next_row["text"].lower()
+                    if "vat at" in next_text and "%" in next_text:
+                        amount_text = extract_amount_from_row(next_row, page_width, sidebar_threshold)
+                        if amount_text:
+                            vat_summary["vat_at_20_percent"] = norm_amount_str(amount_text)
+                            logger.info(f"Found VAT at 20%: {amount_text}")
+            
+            # Regular line item processing (only if we haven't already processed this as a total/VAT)
             amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
             if not amount_text:
                 continue
@@ -608,7 +652,6 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
             
             # Handle duplicate items within same category
             if item_key in items:
-                # Create unique key for duplicates
                 counter = 1
                 new_key = (section_key, f"{normalized_desc}__dup{counter}")
                 while new_key in items:
@@ -621,15 +664,6 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
                 "example": left_text,
                 "page": page_idx
             }
-            
-            # Extract totals
-            text_lower = text.lower()
-            if "total excluding vat" in text_lower:
-                subtotal = amount_value
-            elif "vat at" in text_lower and "total" not in text_lower:
-                vat = amount_value
-            elif "total for this bill" in text_lower or "total owed" in text_lower:
-                total = amount_value
     
     # Convert items to string-keyed dict for JSON serialization
     items_out = {}
@@ -641,7 +675,15 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
             "page": meta["page"]
         }
     
+    # Log what we found for debugging
+    logger.info(f"Parsing Results - Subtotal: {subtotal}, VAT: {vat}, Total: {total}")
+    logger.info(f"VAT Summary: {vat_summary}")
+    logger.info(f"Line Items: {len(items_out)} items")
+    
     return items_out, vat_summary, subtotal, vat, total
+
+
+
 
 # ----------------------------
 # Main PDF Parser
@@ -1323,7 +1365,7 @@ import json
 
 def generate_json_report(bill_a: ParsedBill, bill_b: ParsedBill, 
                         differences: Dict[str, Any], output_path: str) -> None:
-    """Generate JSON comparison report - most reliable option"""
+    """Generate JSON comparison report without separate totals section"""
     
     report_data = {
         "metadata": {
@@ -1345,27 +1387,13 @@ def generate_json_report(bill_a: ParsedBill, bill_b: ParsedBill,
             "equal": differences['address']['equal'],
             "status": "OK" if differences['address']['equal'] else "DIFF"
         },
-        "totals_comparison": {},
-        "line_items": {},
-        "vat_summary": {}
+        "line_items": differences.get('items', {}),
+        # We're removing the separate totals_comparison section
+        # since the data is not being extracted properly
     }
     
-    # Add totals
-    for field in ['subtotal', 'vat', 'total']:
-        diff_data = differences[field]
-        report_data["totals_comparison"][field] = {
-            "amount_a": diff_data['a'],
-            "amount_b": diff_data['b'],
-            "equal": diff_data['equal'],
-            "status": "OK" if diff_data['equal'] else "DIFF"
-        }
-    
-    # Add line items
-    if 'items' in differences:
-        report_data["line_items"] = differences['items']
-    
-    # Add VAT summary
-    if 'vat_summary' in differences:
+    # Only include VAT summary if we have data
+    if differences.get('vat_summary'):
         report_data["vat_summary"] = differences['vat_summary']
     
     # Write JSON file
@@ -1394,7 +1422,7 @@ def json_to_html_report(json_file_path: str, output_html_path: str) -> None:
         raise
 
 def generate_html_from_json(report_data: Dict) -> str:
-    """Generate professional HTML from JSON report data"""
+    """Generate professional HTML from JSON report data without separate totals section"""
     
     metadata = report_data.get('metadata', {})
     account_comp = report_data.get('account_comparison', {})
@@ -1414,6 +1442,37 @@ def generate_html_from_json(report_data: Dict) -> str:
     else:
         score_class = "score-low"
         score_icon = "❌"
+    
+    # Prepare line items including VAT and Total if available
+    all_line_items = dict(line_items)  # Start with regular line items
+    
+    # Add VAT as a special line item if available
+    vat_amount_a = totals_comp.get('vat', {}).get('amount_a')
+    vat_amount_b = totals_comp.get('vat', {}).get('amount_b')
+    if vat_amount_a or vat_amount_b:
+        all_line_items["vat_summary||vat_amount"] = {
+            "a_amount": vat_amount_a,
+            "b_amount": vat_amount_b,
+            "equal": totals_comp.get('vat', {}).get('equal', False),
+            "delta": calculate_delta(vat_amount_a, vat_amount_b),
+            "status": "OK" if totals_comp.get('vat', {}).get('equal', False) else "DIFF",
+            "example_a": "VAT Amount",
+            "example_b": "VAT Amount"
+        }
+    
+    # Add Total as a special line item if available
+    total_amount_a = totals_comp.get('total', {}).get('amount_a')
+    total_amount_b = totals_comp.get('total', {}).get('amount_b')
+    if total_amount_a or total_amount_b:
+        all_line_items["overview||total_amount"] = {
+            "a_amount": total_amount_a,
+            "b_amount": total_amount_b,
+            "equal": totals_comp.get('total', {}).get('equal', False),
+            "delta": calculate_delta(total_amount_a, total_amount_b),
+            "status": "OK" if totals_comp.get('total', {}).get('equal', False) else "DIFF",
+            "example_a": "Total Amount",
+            "example_b": "Total Amount"
+        }
     
     html = f"""
     <!DOCTYPE html>
@@ -1448,6 +1507,8 @@ def generate_html_from_json(report_data: Dict) -> str:
             .file-card {{ flex: 1; min-width: 300px; background: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #0047ab; }}
             .summary-card {{ background: #f8f9fa; padding: 15px; border-radius: 6px; margin: 10px 0; }}
             .address-block {{ background: #f8f9fa; padding: 10px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; }}
+            .total-row {{ background: #e8f4ff !important; font-weight: bold; border-top: 2px solid #0047ab; }}
+            .vat-row {{ background: #f0f8ff !important; font-weight: 600; }}
         </style>
     </head>
     <body>
@@ -1501,8 +1562,8 @@ def generate_html_from_json(report_data: Dict) -> str:
                         </tr>
                         <tr>
                             <td><strong>Billing Address</strong></td>
-                            <td><div class="address-block">{format_address(account_comp.get('account_a', '—'))}</div></td>
-                            <td><div class="address-block">{format_address(account_comp.get('account_b', '—'))}</div></td>
+                            <td><div class="address-block">{format_address(address_comp.get('address_a', '—'))}</div></td>
+                            <td><div class="address-block">{format_address(address_comp.get('address_b', '—'))}</div></td>
                             <td>
                                 <span class="{'status-ok' if address_comp.get('equal') else 'status-diff'}">
                                     {'✅ OK' if address_comp.get('equal') else f'❌ DIFF ({address_comp.get("similarity", 0)}% similar)'}
@@ -1513,48 +1574,12 @@ def generate_html_from_json(report_data: Dict) -> str:
                 </table>
             </div>
 
-            <!-- Summary Totals -->
+            <!-- Combined Line Items, VAT and Total -->
             <div class="section">
-                <h2>💰 Summary Totals</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Metric</th>
-                            <th>Bill A</th>
-                            <th>Bill B</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <h2>📋 Line Item Comparison (Including VAT & Total)</h2>
     """
     
-    # Add totals rows
-    for field_name, field_data in totals_comp.items():
-        display_name = field_name.replace('_', ' ').title()
-        html += f"""
-                        <tr>
-                            <td><strong>{display_name}</strong></td>
-                            <td>£{field_data.get('amount_a', '—')}</td>
-                            <td>£{field_data.get('amount_b', '—')}</td>
-                            <td>
-                                <span class="{'status-ok' if field_data.get('equal') else 'status-diff'}">
-                                    {'✅ OK' if field_data.get('equal') else '❌ DIFF'}
-                                </span>
-                            </td>
-                        </tr>
-        """
-    
-    html += """
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- Line Items -->
-            <div class="section">
-                <h2>📋 Line Item Comparison</h2>
-    """
-    
-    if line_items:
+    if all_line_items:
         html += """
                 <table>
                     <thead>
@@ -1569,26 +1594,43 @@ def generate_html_from_json(report_data: Dict) -> str:
                     <tbody>
         """
         
-        for item_key, item_data in line_items.items():
+        # Sort items to show totals at the bottom
+        sorted_items = sorted(all_line_items.items(), 
+                            key=lambda x: ('total' in x[0].lower() or 'vat' in x[0].lower(), x[0]))
+        
+        for item_key, item_data in sorted_items:
+            # Determine row class for styling
+            row_class = ""
+            if 'total' in item_key.lower():
+                row_class = "total-row"
+            elif 'vat' in item_key.lower():
+                row_class = "vat-row"
+            
             status_class = "status-ok" if item_data.get('equal') else "status-diff"
             status_icon = "✅" if item_data.get('equal') else "❌"
             status_text = "OK" if item_data.get('equal') else item_data.get('status', 'DIFF')
             
             delta = item_data.get('delta')
             delta_html = "—"
-            if delta:
+            if delta and delta != 'None':
                 if delta.startswith('-'):
                     delta_html = f'<span class="delta-negative">{delta}</span>'
                 else:
                     delta_html = f'<span class="delta-positive">+{delta}</span>'
             
+            # Format amounts with £ symbol
+            amount_a = item_data.get('a_amount', '—')
+            amount_b = item_data.get('b_amount', '—')
+            formatted_a = f"£{amount_a}" if amount_a and amount_a != '—' and amount_a != 'None' else '—'
+            formatted_b = f"£{amount_b}" if amount_b and amount_b != '—' and amount_b != 'None' else '—'
+            
             html += f"""
-                        <tr>
+                        <tr class="{row_class}">
                             <td><strong>{item_key}</strong><br>
                                 <small style="color: #666;">{item_data.get('example_a') or item_data.get('example_b') or ''}</small>
                             </td>
-                            <td>£{item_data.get('a_amount', '—')}</td>
-                            <td>£{item_data.get('b_amount', '—')}</td>
+                            <td>{formatted_a}</td>
+                            <td>{formatted_b}</td>
                             <td>{delta_html}</td>
                             <td><span class="{status_class}">{status_icon} {status_text}</span></td>
                         </tr>
@@ -1610,6 +1652,18 @@ def generate_html_from_json(report_data: Dict) -> str:
     
     return html
 
+
+def calculate_delta(amount_a: Optional[str], amount_b: Optional[str]) -> Optional[str]:
+    """Calculate delta between two amounts"""
+    if not amount_a or not amount_b or amount_a == 'None' or amount_b == 'None':
+        return None
+    
+    try:
+        delta = Decimal(amount_b) - Decimal(amount_a)
+        return str(delta.quantize(Decimal("0.01")))
+    except (InvalidOperation, ValueError):
+        return None
+
 def get_score_interpretation(score: float) -> str:
     """Get human-readable interpretation of match score"""
     if score >= 95:
@@ -1625,7 +1679,7 @@ def get_score_interpretation(score: float) -> str:
 
 def format_address(address: str) -> str:
     """Format address for better display"""
-    if not address:
+    if not address or address == 'None':
         return "Not found"
     # Replace pipe separators with line breaks
     return address.replace(' | ', '\n')
