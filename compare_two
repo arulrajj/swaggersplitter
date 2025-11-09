@@ -673,6 +673,48 @@ def parse_pdf_bill(pdf_path: str) -> ParsedBill:
 # ----------------------------
 # Comparison Logic
 # ----------------------------
+def calculate_comprehensive_match_score(differences: Dict[str, Any]) -> float:
+    """Calculate more comprehensive match score including line items"""
+    
+    weights = {
+        'account': 10,           # 10% weight
+        'address': 10,           # 10% weight  
+        'subtotal': 15,          # 15% weight
+        'vat': 15,               # 15% weight
+        'total': 20,             # 20% weight (most important)
+        'line_items': 30         # 30% weight for all line items
+    }
+    
+    total_score = 0
+    
+    # Top-level fields (60% total)
+    for field in ['account', 'address', 'subtotal', 'vat', 'total']:
+        if differences[field]['equal']:
+            total_score += weights[field]
+    
+    # Line items comparison (30% total)
+    if 'items' in differences and differences['items']:
+        items_data = differences['items']
+        matching_items = sum(1 for item in items_data.values() if item.get('equal', False))
+        total_items = len(items_data)
+        
+        if total_items > 0:
+            line_item_score = (matching_items / total_items) * weights['line_items']
+            total_score += line_item_score
+    
+    # VAT summary (10% - if present)
+    if 'vat_summary' in differences and differences['vat_summary']:
+        vat_data = differences['vat_summary']
+        matching_vat = sum(1 for vat_item in vat_data.values() if vat_item.get('equal', False))
+        total_vat = len(vat_data)
+        
+        if total_vat > 0:
+            vat_score = (matching_vat / total_vat) * 10  # 10% weight
+            total_score += vat_score
+    
+    return round(total_score, 1)
+
+
 def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Decimal = Decimal("0.01")) -> Dict[str, Any]:
     """Compare two parsed bills and generate detailed differences"""
     
@@ -782,7 +824,7 @@ def compare_bills(bill_a: ParsedBill, bill_b: ParsedBill, amount_tolerance: Deci
     top_level_checks = ["account", "address", "subtotal", "vat", "total"]
     matching_checks = sum(1 for check in top_level_checks if differences[check]["equal"])
     match_score = round((matching_checks / len(top_level_checks)) * 100, 1)
-    differences["match_score"] = match_score
+    differences["match_score"] = calculate_comprehensive_match_score(differences)
     
     # Ensure we return a plain dictionary
     return dict(differences)
