@@ -1647,13 +1647,22 @@ def process_batch_comparison(dir_a: str, dir_b: str, output_dir: str,
             logger.error(f"Failed to process {pdf_file}: {e}")
             continue
     
+    # FIXED: Pass the report_format parameter
     generate_index_page(index_entries, output_dir, report_format)
 
-def generate_index_page(entries: List[Dict], output_dir: str) -> None:
+
+def generate_index_page(entries: List[Dict], output_dir: str, report_format: str = "json") -> None:
     """Generate index page with links to all comparison reports"""
     index_path = os.path.join(output_dir, 'index.html')
     
     entries_sorted = sorted(entries, key=lambda x: x['score'], reverse=True)
+    
+    # Determine file extension based on format
+    file_ext = {
+        'json': '.json',
+        'text': '.txt', 
+        'csv': '.csv'
+    }.get(report_format, '.json')
     
     html_content = f"""
     <!DOCTYPE html>
@@ -1674,13 +1683,14 @@ def generate_index_page(entries: List[Dict], output_dir: str) -> None:
             .score-medium {{ color: #ffc107; font-weight: bold; }}
             .score-low {{ color: #dc3545; font-weight: bold; }}
             .timestamp {{ color: #666; margin-bottom: 20px; }}
+            .format-badge {{ background: #6c757d; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.8em; margin-left: 10px; }}
         </style>
     </head>
     <body>
         <div class="container">
             <h1>BT Bill Comparison Reports</h1>
             <div class="timestamp">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
-            <p>Total reports: {len(entries)}</p>
+            <p>Total reports: {len(entries)} <span class="format-badge">Format: {report_format.upper()}</span></p>
             
             <table>
                 <thead>
@@ -1719,20 +1729,42 @@ def generate_index_page(entries: List[Dict], output_dir: str) -> None:
 # ----------------------------
 # Command Line Interface
 # ----------------------------
+def convert_existing_json_to_html(json_dir: str) -> None:
+    """Convert all existing JSON reports in directory to HTML"""
+    json_files = [f for f in os.listdir(json_dir) if f.endswith('.json')]
+    
+    if not json_files:
+        logger.warning(f"No JSON files found in {json_dir}")
+        return
+    
+    for json_file in json_files:
+        json_path = os.path.join(json_dir, json_file)
+        html_file = json_file.replace('.json', '.html')
+        html_path = os.path.join(json_dir, html_file)
+        
+        try:
+            json_to_html_report(json_path, html_path)
+            logger.info(f"Converted {json_file} to {html_file}")
+        except Exception as e:
+            logger.error(f"Failed to convert {json_file}: {e}")
+
+# Update main function to handle this new argument
 def main():
     parser = argparse.ArgumentParser(
         description='BT Bill Comparison Tool - Production Version',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument('--dirA', required=True, help='Directory containing original PDF bills')
-    parser.add_argument('--dirB', required=True, help='Directory containing new PDF bills for comparison')
-    parser.add_argument('--out', required=True, help='Output directory for reports')
+    parser.add_argument('--dirA', help='Directory containing original PDF bills')
+    parser.add_argument('--dirB', help='Directory containing new PDF bills for comparison')
+    parser.add_argument('--out', help='Output directory for reports')
     parser.add_argument('--files', nargs='*', help='Specific PDF files to compare (optional)')
     parser.add_argument('--format', choices=['json', 'text', 'csv'], default='json', 
                        help='Output format for reports (default: json)')
     parser.add_argument('--convert-to-html', action='store_true', 
                        help='Convert JSON reports to HTML after generation')
+    parser.add_argument('--convert-existing-json', metavar='DIRECTORY',
+                       help='Convert existing JSON reports in directory to HTML')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
@@ -1740,12 +1772,21 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Handle conversion of existing JSON files
+    if args.convert_existing_json:
+        convert_existing_json_to_html(args.convert_existing_json)
+        return
+    
+    # Validate required arguments for normal operation
+    if not args.dirA or not args.dirB or not args.out:
+        parser.error("--dirA, --dirB, and --out are required for bill comparison")
+    
     # Process comparisons
     process_batch_comparison(args.dirA, args.dirB, args.out, args.files, args.format)
     
     # Convert JSON to HTML if requested
     if args.convert_to_html and args.format == 'json':
-        convert_all_json_to_html(args.out)
+        convert_existing_json_to_html(args.out)
 
 def convert_all_json_to_html(output_dir: str):
     """Convert all JSON reports in directory to HTML"""
