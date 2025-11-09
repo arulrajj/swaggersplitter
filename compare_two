@@ -131,6 +131,63 @@ def norm_amount_str(s: str) -> Optional[Decimal]:
     except (InvalidOperation, ValueError):
         return None
 
+UK_POSTCODE_RE = re.compile(
+    r'([A-Z]{1,2}[0-9][A-Z0-9]?[ ]?[0-9][A-Z]{2}|'
+    r'GIR[ ]?0AA|'
+    r'[A-Z]{1,2}[0-9][ ]?[0-9][A-Z]{2})', 
+    re.IGNORECASE
+)
+
+def extract_address_with_postcode(page_data: Dict) -> Optional[str]:
+    """Extract billing address using UK postcode detection on page 1"""
+    if not page_data or "spans" not in page_data:
+        return None
+    
+    rows = group_spans_to_rows(page_data["spans"])
+    
+    # Find UK postcodes in the page
+    postcode_rows = []
+    for i, row in enumerate(rows):
+        if UK_POSTCODE_RE.search(row["text"]):
+            postcode_rows.append((i, row))
+    
+    if not postcode_rows:
+        logger.debug("No UK postcodes found on page 1")
+        return None
+    
+    # For each postcode found, collect address lines by going backwards
+    potential_addresses = []
+    
+    for postcode_idx, postcode_row in postcode_rows:
+        address_lines = []
+        
+        # Start from the postcode row and go backwards up to 6 lines
+        start_idx = max(0, postcode_idx - 6)
+        
+        for idx in range(start_idx, postcode_idx + 1):
+            line_text = rows[idx]["text"].strip()
+            
+            # Skip empty lines and obvious non-address content
+            if not line_text:
+                continue
+            if any(phrase in line_text.lower() for phrase in [
+                "account", "invoice", "bill", "date", "page", "vat", "total"
+            ]):
+                continue
+                
+            address_lines.append(line_text)
+        
+        if address_lines:
+            potential_address = " | ".join(address_lines)
+            potential_addresses.append(potential_address)
+    
+    # Return the most likely address (usually the first one found)
+    if potential_addresses:
+        logger.debug(f"Found potential addresses: {potential_addresses}")
+        return potential_addresses[0]
+    
+    return None
+
 def similar(a: str, b: str) -> int:
     """Calculate similarity between two strings (0-100 scale)"""
     if not a or not b:
@@ -380,9 +437,53 @@ def extract_page1_data(pages_spans: List[Dict]) -> Tuple[Optional[str], Optional
     
     page1 = pages_spans[0]
     account = extract_account_from_page1(page1)
-    address = extract_billing_address_from_page1(page1)
     
+    # Try multiple address extraction strategies
+    address = None
+    
+    # Strategy 1: UK Postcode detection
+    address = extract_address_with_postcode(page1)
+    
+    # Strategy 2: Fallback to original billing address detection
+    if not address:
+        address = extract_billing_address_from_page1(page1)
+    
+    # Strategy 3: Look for common address patterns
+    if not address:
+        address = find_address_by_patterns(page1)
+    
+    logger.info(f"Extracted - Account: {account}, Address: {address}")
     return account, address
+
+def find_address_by_patterns(page_data: Dict) -> Optional[str]:
+    """Fallback address detection using common patterns"""
+    if not page_data or "spans" not in page_data:
+        return None
+    
+    rows = group_spans_to_rows(page_data["spans"])
+    address_keywords = ["street", "road", "lane", "avenue", "drive", "close", "court"]
+    
+    for i, row in enumerate(rows):
+        text_lower = row["text"].lower()
+        
+        # Look for lines that might contain address elements
+        if any(keyword in text_lower for keyword in address_keywords):
+            # Collect surrounding lines
+            address_lines = []
+            start_idx = max(0, i - 3)
+            end_idx = min(len(rows), i + 4)
+            
+            for idx in range(start_idx, end_idx):
+                line_text = rows[idx]["text"].strip()
+                if line_text and not any(phrase in line_text.lower() for phrase in [
+                    "account", "invoice", "bill", "date", "page"
+                ]):
+                    address_lines.append(line_text)
+            
+            if address_lines:
+                return " | ".join(address_lines)
+    
+    return None
 
 # ----------------------------
 # Section and Line Item Processing
@@ -1232,6 +1333,261 @@ def generate_json_report(bill_a: ParsedBill, bill_b: ParsedBill,
     logger.info(f"Generated JSON report: {output_path}")
 
 
+def json_to_html_report(json_file_path: str, output_html_path: str) -> None:
+    """Convert JSON report to beautiful HTML for client presentation"""
+    
+    try:
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            report_data = json.load(f)
+        
+        html_content = generate_html_from_json(report_data)
+        
+        with open(output_html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        logger.info(f"Converted JSON to HTML: {output_html_path}")
+        
+    except Exception as e:
+        logger.error(f"Failed to convert JSON to HTML: {e}")
+        raise
+
+def generate_html_from_json(report_data: Dict) -> str:
+    """Generate professional HTML from JSON report data"""
+    
+    metadata = report_data.get('metadata', {})
+    account_comp = report_data.get('account_comparison', {})
+    address_comp = report_data.get('address_comparison', {})
+    totals_comp = report_data.get('totals_comparison', {})
+    line_items = report_data.get('line_items', {})
+    vat_summary = report_data.get('vat_summary', {})
+    
+    # Calculate color-coded score
+    match_score = metadata.get('match_score', 0)
+    if match_score >= 90:
+        score_class = "score-high"
+        score_icon = "✅"
+    elif match_score >= 70:
+        score_class = "score-medium" 
+        score_icon = "⚠️"
+    else:
+        score_class = "score-low"
+        score_icon = "❌"
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>BT Bill Comparison - {metadata.get('file_a', '')} vs {metadata.get('file_b', '')}</title>
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; background: #f8f9fa; margin: 0; padding: 20px; }}
+            .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+            h1 {{ color: #0047ab; margin-bottom: 10px; border-bottom: 2px solid #0047ab; padding-bottom: 10px; }}
+            h2 {{ color: #0056b3; margin: 25px 0 15px 0; padding-bottom: 8px; border-bottom: 1px solid #e0e0e0; }}
+            .header-info {{ background: #e8f4ff; padding: 15px; border-radius: 6px; margin-bottom: 20px; }}
+            .score {{ display: inline-block; padding: 8px 16px; border-radius: 20px; font-weight: bold; margin: 10px 0; }}
+            .score-high {{ background: #d4edda; color: #155724; }}
+            .score-medium {{ background: #fff3cd; color: #856404; }}
+            .score-low {{ background: #f8d7da; color: #721c24; }}
+            table {{ width: 100%; border-collapse: collapse; margin: 15px 0; background: white; }}
+            th, td {{ padding: 12px 15px; text-align: left; border: 1px solid #dee2e6; }}
+            th {{ background: #0047ab; color: white; font-weight: 600; }}
+            tr:nth-child(even) {{ background: #f8f9fa; }}
+            .status-ok {{ background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-weight: bold; }}
+            .status-diff {{ background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-weight: bold; }}
+            .status-missing {{ background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 4px; font-weight: bold; }}
+            .delta-positive {{ color: #dc3545; font-weight: bold; }}
+            .delta-negative {{ color: #28a745; font-weight: bold; }}
+            .section {{ margin-bottom: 30px; }}
+            .timestamp {{ color: #6c757d; font-size: 0.9em; margin-bottom: 20px; }}
+            .file-info {{ display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px; margin: 15px 0; }}
+            .file-card {{ flex: 1; min-width: 300px; background: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #0047ab; }}
+            .summary-card {{ background: #f8f9fa; padding: 15px; border-radius: 6px; margin: 10px 0; }}
+            .address-block {{ background: #f8f9fa; padding: 10px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📊 BT Bill Comparison Report</h1>
+            <div class="timestamp">Generated: {metadata.get('generated', 'Unknown')}</div>
+            
+            <div class="header-info">
+                <div class="file-info">
+                    <div class="file-card">
+                        <strong>📄 File A:</strong> {metadata.get('file_a', 'Unknown')}<br>
+                        <strong>👤 Account:</strong> {account_comp.get('account_a', 'Not found')}<br>
+                    </div>
+                    <div class="file-card">
+                        <strong>📄 File B:</strong> {metadata.get('file_b', 'Unknown')}<br>
+                        <strong>👤 Account:</strong> {account_comp.get('account_b', 'Not found')}<br>
+                    </div>
+                </div>
+                
+                <div class="summary-card">
+                    <strong>Overall Match Score: </strong>
+                    <span class="score {score_class}">{score_icon} {match_score}%</span>
+                    <div style="margin-top: 8px; font-size: 0.9em;">
+                        {get_score_interpretation(match_score)}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Account & Address Comparison -->
+            <div class="section">
+                <h2>👤 Account & Billing Address</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Field</th>
+                            <th>Bill A</th>
+                            <th>Bill B</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Account Number</strong></td>
+                            <td>{account_comp.get('account_a', '—')}</td>
+                            <td>{account_comp.get('account_b', '—')}</td>
+                            <td>
+                                <span class="{'status-ok' if account_comp.get('equal') else 'status-diff'}">
+                                    {'✅ OK' if account_comp.get('equal') else '❌ DIFF'}
+                                </span>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>Billing Address</strong></td>
+                            <td><div class="address-block">{format_address(account_comp.get('account_a', '—'))}</div></td>
+                            <td><div class="address-block">{format_address(account_comp.get('account_b', '—'))}</div></td>
+                            <td>
+                                <span class="{'status-ok' if address_comp.get('equal') else 'status-diff'}">
+                                    {'✅ OK' if address_comp.get('equal') else f'❌ DIFF ({address_comp.get("similarity", 0)}% similar)'}
+                                </span>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Summary Totals -->
+            <div class="section">
+                <h2>💰 Summary Totals</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Bill A</th>
+                            <th>Bill B</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+    """
+    
+    # Add totals rows
+    for field_name, field_data in totals_comp.items():
+        display_name = field_name.replace('_', ' ').title()
+        html += f"""
+                        <tr>
+                            <td><strong>{display_name}</strong></td>
+                            <td>£{field_data.get('amount_a', '—')}</td>
+                            <td>£{field_data.get('amount_b', '—')}</td>
+                            <td>
+                                <span class="{'status-ok' if field_data.get('equal') else 'status-diff'}">
+                                    {'✅ OK' if field_data.get('equal') else '❌ DIFF'}
+                                </span>
+                            </td>
+                        </tr>
+        """
+    
+    html += """
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Line Items -->
+            <div class="section">
+                <h2>📋 Line Item Comparison</h2>
+    """
+    
+    if line_items:
+        html += """
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Category & Description</th>
+                            <th>Bill A Amount</th>
+                            <th>Bill B Amount</th>
+                            <th>Delta (B - A)</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        """
+        
+        for item_key, item_data in line_items.items():
+            status_class = "status-ok" if item_data.get('equal') else "status-diff"
+            status_icon = "✅" if item_data.get('equal') else "❌"
+            status_text = "OK" if item_data.get('equal') else item_data.get('status', 'DIFF')
+            
+            delta = item_data.get('delta')
+            delta_html = "—"
+            if delta:
+                if delta.startswith('-'):
+                    delta_html = f'<span class="delta-negative">{delta}</span>'
+                else:
+                    delta_html = f'<span class="delta-positive">+{delta}</span>'
+            
+            html += f"""
+                        <tr>
+                            <td><strong>{item_key}</strong><br>
+                                <small style="color: #666;">{item_data.get('example_a') or item_data.get('example_b') or ''}</small>
+                            </td>
+                            <td>£{item_data.get('a_amount', '—')}</td>
+                            <td>£{item_data.get('b_amount', '—')}</td>
+                            <td>{delta_html}</td>
+                            <td><span class="{status_class}">{status_icon} {status_text}</span></td>
+                        </tr>
+            """
+        
+        html += """
+                    </tbody>
+                </table>
+        """
+    else:
+        html += '<div class="summary-card">No line items found for comparison</div>'
+    
+    html += """
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+def get_score_interpretation(score: float) -> str:
+    """Get human-readable interpretation of match score"""
+    if score >= 95:
+        return "Excellent match - bills are nearly identical"
+    elif score >= 85:
+        return "Good match - minor differences detected"
+    elif score >= 70:
+        return "Fair match - some significant differences"
+    elif score >= 50:
+        return "Poor match - major differences detected"
+    else:
+        return "Very poor match - bills are substantially different"
+
+def format_address(address: str) -> str:
+    """Format address for better display"""
+    if not address:
+        return "Not found"
+    # Replace pipe separators with line breaks
+    return address.replace(' | ', '\n')
+
 
 # ----------------------------
 # Batch Processing
@@ -1364,44 +1720,47 @@ def generate_index_page(entries: List[Dict], output_dir: str) -> None:
 # Command Line Interface
 # ----------------------------
 def main():
-    """Main command line interface"""
     parser = argparse.ArgumentParser(
         description='BT Bill Comparison Tool - Production Version',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  python bt_bill_compare_production.py --dirA ./old_bills --dirB ./new_bills --out ./reports
-  python bt_bill_compare_production.py --dirA ./old --dirB ./new --out ./comparisons --files bill1.pdf bill2.pdf
-        '''
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     parser.add_argument('--dirA', required=True, help='Directory containing original PDF bills')
     parser.add_argument('--dirB', required=True, help='Directory containing new PDF bills for comparison')
-    parser.add_argument('--out', required=True, help='Output directory for HTML reports')
+    parser.add_argument('--out', required=True, help='Output directory for reports')
     parser.add_argument('--files', nargs='*', help='Specific PDF files to compare (optional)')
+    parser.add_argument('--format', choices=['json', 'text', 'csv'], default='json', 
+                       help='Output format for reports (default: json)')
+    parser.add_argument('--convert-to-html', action='store_true', 
+                       help='Convert JSON reports to HTML after generation')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
     
-    # Set logging level
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Validate directories
-    if not os.path.isdir(args.dirA):
-        logger.error(f"Directory A does not exist: {args.dirA}")
-        sys.exit(1)
+    # Process comparisons
+    process_batch_comparison(args.dirA, args.dirB, args.out, args.files, args.format)
     
-    if not os.path.isdir(args.dirB):
-        logger.error(f"Directory B does not exist: {args.dirB}")
-        sys.exit(1)
+    # Convert JSON to HTML if requested
+    if args.convert_to_html and args.format == 'json':
+        convert_all_json_to_html(args.out)
+
+def convert_all_json_to_html(output_dir: str):
+    """Convert all JSON reports in directory to HTML"""
+    json_files = [f for f in os.listdir(output_dir) if f.endswith('.json')]
     
-    try:
-        process_batch_comparison(args.dirA, args.dirB, args.out, args.files)
-        logger.info("Batch comparison completed successfully")
-    except Exception as e:
-        logger.error(f"Batch comparison failed: {e}")
-        sys.exit(1)
+    for json_file in json_files:
+        json_path = os.path.join(output_dir, json_file)
+        html_file = json_file.replace('.json', '.html')
+        html_path = os.path.join(output_dir, html_file)
+        
+        try:
+            json_to_html_report(json_path, html_path)
+            logger.info(f"Converted {json_file} to {html_file}")
+        except Exception as e:
+            logger.error(f"Failed to convert {json_file}: {e}")
 
 if __name__ == '__main__':
     main()
