@@ -106,7 +106,13 @@ INFO_PHRASES = [
     "bt order ref", "your order ref", "this is the", "this is your",
     "vat calculation", "items where vat is charged", "vat summary",
     "your vat summary", "total which includes", "amount vat rate",
-    "order ref", "your ref", "this is"
+    "order ref", "your ref", "this is", "we'll take payment on",
+    "payment on or after", "payment date", "registered in england no",
+    "registered number", "company number", "registered office",
+    "vat number", "invoice number", "page", "of pages", "telephone",
+    "phone number", "date:", "from", "to", "period", "british telecommunications",
+    "registered office", "london", "company", "plc", "take payment",
+    "direct debit", "bank account", "sort code"
 ]
 
 ParsedBill = namedtuple("ParsedBill", [
@@ -198,7 +204,7 @@ def similar(a: str, b: str) -> int:
         return int(SequenceMatcher(None, a, b).ratio() * 100)
 
 def is_informational_text(text: str) -> bool:
-    """Check if text should be treated as informational (non-charge)"""
+    """Enhanced informational text detection"""
     text_lower = text.lower()
     
     # Check against known informational phrases
@@ -207,10 +213,24 @@ def is_informational_text(text: str) -> bool:
     
     # Check if it's primarily a date/year reference
     if DATE_RE.search(text) or YEAR_RE.search(text):
-        if not AMOUNT_RE.search(text):
-            return True
+        return True
+    
+    # Check for registration numbers and addresses
+    if any(pattern in text_lower for pattern in [
+        "registered in england", "company number", "registered office",
+        "london", "postcode", "account number", "order reference"
+    ]):
+        return True
+    
+    # Check for payment instructions
+    if any(pattern in text_lower for pattern in [
+        "we'll take payment", "payment will be taken", "direct debit",
+        "on or after", "payment date"
+    ]):
+        return True
     
     return False
+
 
 # ----------------------------
 # PDF Text Extraction
@@ -498,9 +518,60 @@ def detect_section_for_text(text: str) -> Optional[str]:
                 return section_key
     return None
 
+def is_valid_amount_context(text: str, amount_text: str) -> bool:
+    """
+    Check if the extracted amount is in a valid monetary context
+    and not part of dates, registration numbers, etc.
+    """
+    text_lower = text.lower()
+    
+    # Common phrases that indicate non-monetary contexts
+    non_monetary_phrases = [
+        "we'll take payment on", "payment on or after", "payment date",
+        "registered in england no", "registered number", "company number",
+        "registered office", "vat number", "account number", "order ref",
+        "invoice number", "page", "of pages", "telephone", "phone number",
+        "date:", "bill date", "due date", "from", "to", "period"
+    ]
+    
+    # If text contains non-monetary phrases, reject the amount
+    if any(phrase in text_lower for phrase in non_monetary_phrases):
+        return False
+    
+    # Check if amount looks like a date (day of month)
+    try:
+        amount_num = int(amount_text.split('.')[0])  # Get integer part
+        if 1 <= amount_num <= 31:  # Days of month
+            # Check if there are date indicators nearby
+            date_indicators = ["jan", "feb", "mar", "apr", "may", "jun", 
+                             "jul", "aug", "sep", "oct", "nov", "dec",
+                             "st", "nd", "rd", "th"]
+            if any(indicator in text_lower for indicator in date_indicators):
+                return False
+    except (ValueError, IndexError):
+        pass
+    
+    # Check if amount is part of an address or registration number
+    address_indicators = ["street", "road", "lane", "avenue", "drive", 
+                         "registered office", "london", "company", "plc"]
+    if any(indicator in text_lower for indicator in address_indicators):
+        return False
+    
+    # Check for monetary context indicators
+    monetary_indicators = [
+        "£", "pound", "gbp", "charge", "amount", "total", "vat",
+        "discount", "credit", "debit", "payment", "fee", "cost",
+        "price", "rate", "bill", "invoice", "owing", "due"
+    ]
+    
+    # If we have monetary indicators, it's more likely a valid amount
+    has_monetary_context = any(indicator in text_lower for indicator in monetary_indicators)
+    
+    return has_monetary_context
+
 def extract_amount_from_row(row: Dict, page_width: float, sidebar_threshold: float) -> Optional[str]:
     """
-    Enhanced amount extraction with better right-side detection
+    Enhanced amount extraction with strict context validation
     """
     # Prioritize spans in the far right area (likely amounts)
     rightmost_spans = [
@@ -515,8 +586,12 @@ def extract_amount_from_row(row: Dict, page_width: float, sidebar_threshold: flo
             amount_text = amount_match.group(1)
             # Filter out dates and years
             if not (YEAR_RE.search(amount_text) or DATE_RE.search(span["text"])):
-                logger.debug(f"Found amount in rightmost span: {amount_text} from '{span['text']}'")
-                return amount_text
+                # Check if this is a valid monetary context
+                if is_valid_amount_context(row["text"], amount_text):
+                    logger.debug(f"Found valid amount: {amount_text} from '{span['text']}'")
+                    return amount_text
+                else:
+                    logger.debug(f"Rejected non-monetary amount: {amount_text} from '{span['text']}'")
     
     # Fallback: check all spans in main content area
     for span in row["spans"]:
@@ -527,10 +602,15 @@ def extract_amount_from_row(row: Dict, page_width: float, sidebar_threshold: flo
         if amount_match:
             amount_text = amount_match.group(1)
             if not (YEAR_RE.search(amount_text) or DATE_RE.search(span["text"])):
-                logger.debug(f"Found amount in main span: {amount_text} from '{span['text']}'")
-                return amount_text
+                # Check if this is a valid monetary context
+                if is_valid_amount_context(row["text"], amount_text):
+                    logger.debug(f"Found valid amount: {amount_text} from '{span['text']}'")
+                    return amount_text
+                else:
+                    logger.debug(f"Rejected non-monetary amount: {amount_text} from '{span['text']}'")
     
     return None
+
 
 def normalize_line_description(text: str) -> str:
     """Normalize line item description for consistent matching"""
