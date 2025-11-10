@@ -629,7 +629,7 @@ def normalize_line_description(text: str) -> str:
 
 def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
     """
-    Parse line items with proper totals and VAT extraction
+    Parse line items with strict amount validation
     """
     items = {}
     current_section = None
@@ -654,63 +654,21 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
             
             # Skip informational text without amounts
             if is_informational_text(text):
+                logger.debug(f"Skipping informational text: {text}")
                 continue
             
-            # SPECIAL HANDLING: Extract totals and VAT from specific patterns
-            text_lower = text.lower()
-            
-            # Extract Total (most important)
-            if any(phrase in text_lower for phrase in [
-                "total for this bill", "total owed", "total including vat", 
-                "total amount", "bill total", "total payable"
-            ]):
-                amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
-                if amount_text:
-                    total = norm_amount_str(amount_text)
-                    vat_summary["total_for_bill"] = total
-                    logger.info(f"Found Total: {total} in text: {text}")
-                continue
-            
-            # Extract Subtotal (total excluding VAT)
-            if any(phrase in text_lower for phrase in [
-                "total excluding vat", "subtotal", "net total", "total before vat"
-            ]):
-                amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
-                if amount_text:
-                    subtotal = norm_amount_str(amount_text)
-                    vat_summary["total_excluding_vat"] = subtotal
-                    logger.info(f"Found Subtotal: {subtotal} in text: {text}")
-                continue
-            
-            # Extract VAT amount
-            if any(phrase in text_lower for phrase in [
-                "vat at", "total vat", "vat amount", "vat charged"
-            ]) and "vat summary" not in text_lower:
-                amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
-                if amount_text:
-                    vat = norm_amount_str(amount_text)
-                    vat_summary["total_vat"] = vat
-                    logger.info(f"Found VAT: {vat} in text: {text}")
-                continue
-            
-            # Extract VAT summary details
-            if "vat summary" in text_lower or "vat calculation" in text_lower:
-                # Look for VAT rate details in subsequent rows
-                for next_row in rows[rows.index(row) + 1:rows.index(row) + 5]:
-                    next_text = next_row["text"].lower()
-                    if "vat at" in next_text and "%" in next_text:
-                        amount_text = extract_amount_from_row(next_row, page_width, sidebar_threshold)
-                        if amount_text:
-                            vat_summary["vat_at_20_percent"] = norm_amount_str(amount_text)
-                            logger.info(f"Found VAT at 20%: {amount_text}")
-            
-            # Regular line item processing (only if we haven't already processed this as a total/VAT)
+            # Extract amount with strict validation
             amount_text = extract_amount_from_row(row, page_width, sidebar_threshold)
             if not amount_text:
                 continue
             
             amount_value = norm_amount_str(amount_text)
             if amount_value is None:
+                continue
+            
+            # Additional validation: reject very small amounts that are likely page numbers etc.
+            if amount_value < Decimal("1.00"):
+                logger.debug(f"Rejected small amount (likely page number): {amount_value} from '{text}'")
                 continue
             
             # Extract and normalize description from left portion
@@ -724,6 +682,11 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
                 
             normalized_desc = normalize_line_description(left_text)
             if not normalized_desc:
+                continue
+            
+            # Final validation: check if the description suggests this is a real charge
+            if not is_likely_charge_description(normalized_desc):
+                logger.debug(f"Rejected unlikely charge: {normalized_desc} with amount {amount_value}")
                 continue
             
             # Use category + description as unique key
@@ -744,6 +707,7 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
                 "example": left_text,
                 "page": page_idx
             }
+            logger.info(f"Added valid charge: {normalized_desc} = £{amount_value}")
     
     # Convert items to string-keyed dict for JSON serialization
     items_out = {}
@@ -755,14 +719,36 @@ def parse_line_items(pages_spans: List[Dict]) -> Tuple[Dict, Dict, Optional[Deci
             "page": meta["page"]
         }
     
-    # Log what we found for debugging
-    logger.info(f"Parsing Results - Subtotal: {subtotal}, VAT: {vat}, Total: {total}")
-    logger.info(f"VAT Summary: {vat_summary}")
-    logger.info(f"Line Items: {len(items_out)} items")
+    logger.info(f"Parsing Results - Found {len(items_out)} valid line items")
     
     return items_out, vat_summary, subtotal, vat, total
 
 
+
+def is_likely_charge_description(description: str) -> bool:
+    """
+    Check if the description is likely to be a real charge item
+    """
+    desc_lower = description.lower()
+    
+    # Indicators of real charges
+    charge_indicators = [
+        "charge", "service", "fee", "rental", "line", "broadband",
+        "fibre", "voice", "cloud", "discount", "credit", "loyalty",
+        "offer", "promotion", "setup", "installation", "delivery"
+    ]
+    
+    # Exclude common non-charge descriptions
+    non_charge_indicators = [
+        "page", "date", "account", "address", "registered", "company",
+        "payment", "direct debit", "bank", "vat", "total", "subtotal"
+    ]
+    
+    has_charge_indicators = any(indicator in desc_lower for indicator in charge_indicators)
+    has_non_charge_indicators = any(indicator in desc_lower for indicator in non_charge_indicators)
+    
+    # It's likely a charge if it has charge indicators AND doesn't have strong non-charge indicators
+    return has_charge_indicators and not has_non_charge_indicators
 
 
 # ----------------------------
