@@ -1474,6 +1474,7 @@ def generate_json_report(bill_a: ParsedBill, bill_b: ParsedBill,
     logger.info(f"Generated JSON report: {output_path}")
 
 
+
 def json_to_html_report(json_file_path: str, output_html_path: str) -> None:
     """Convert JSON report to beautiful HTML for client presentation"""
     
