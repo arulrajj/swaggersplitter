@@ -68,31 +68,36 @@ SECTION_KEYWORDS = {
     "regular_charges": [
         "regular charges", "regular charge", "regular charges -",
         "bundled services", "charges for bundle", "phone services",
-        "charges for your", "s fibre", "sogea"
+        "charges for your", "s fibre", "sogea", "monthly charges"
     ],
     "one_off": [
         "one-off charges and credits", "one off charges and credits", 
         "one-off charges", "one off charges", "one-off",
         "bt cloud voice service connection", "bt cloud voice user set-up",
-        "bt cloud voice cpe delivery"
+        "bt cloud voice cpe delivery", "connection charge"
     ],
     "discounts": [
         "discounts", "discounts and credits", "discount",
-        "loyalty", "credit in advance", "ret loyalty"
+        "loyalty", "credit in advance", "ret loyalty", "credit"
     ],
     "usage_charges": [
-        "usage charges", "chargeable usage"
+        "usage charges", "chargeable usage", "call charges"
     ],
     "vat_summary": [
         "vat summary", "your vat summary", "total vat", "vat at",
-        "vat calculation", "items where vat is charged"
+        "vat calculation", "items where vat is charged", "vat breakdown"
     ],
     "charges_detail": [
         "your charges in detail", "charges for", "charges in detail"
     ],
     "overview": [
         "total for this bill", "total owed on this account", "this bill",
-        "total which includes", "total", "totals"
+        "total which includes", "total including vat", "bill total",
+        "total payable", "amount due"
+    ],
+    "totals_section": [
+        "total excluding vat", "subtotal", "net amount",
+        "total before vat", "total amount"
     ]
 }
 
