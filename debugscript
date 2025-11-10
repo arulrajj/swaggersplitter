@@ -1,0 +1,54 @@
+import json
+import os
+from your_main_script import extract_spans  # Import from your actual script
+
+def debug_extract_spans(pdf_path: str, output_json_path: str):
+    """
+    Extract spans from PDF and save as JSON for analysis
+    """
+    print(f"Extracting spans from: {pdf_path}")
+    
+    # Get the spans data
+    pages_spans = extract_spans(pdf_path, use_ocr_fallback=True)
+    
+    # Convert to JSON-serializable format
+    serializable_data = []
+    for page_idx, page in enumerate(pages_spans):
+        page_data = {
+            "page_number": page_idx,
+            "width": page["width"],
+            "height": page["height"],
+            "spans": []
+        }
+        
+        for span in page["spans"]:
+            page_data["spans"].append({
+                "text": span["text"],
+                "x0": span["x0"],
+                "y0": span["y0"], 
+                "x1": span["x1"],
+                "y1": span["y1"],
+                "size": span.get("size", 0)
+            })
+        
+        serializable_data.append(page_data)
+    
+    # Save to JSON file
+    with open(output_json_path, 'w', encoding='utf-8') as f:
+        json.dump(serializable_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"Saved spans data to: {output_json_path}")
+    print(f"Total pages: {len(serializable_data)}")
+    
+    # Print some summary info
+    for page_idx, page in enumerate(serializable_data):
+        print(f"Page {page_idx}: {len(page['spans'])} spans")
+        # Show first few spans to verify data
+        for span in page['spans'][:5]:
+            print(f"  Text: '{span['text']}' | Position: ({span['x0']:.1f}, {span['y0']:.1f})")
+
+# Usage - run this on one of your problematic PDFs
+if __name__ == "__main__":
+    pdf_file = "path_to_your_bt_bill.pdf"  # Replace with actual path
+    output_file = "spans_debug_output.json"
+    debug_extract_spans(pdf_file, output_file)
