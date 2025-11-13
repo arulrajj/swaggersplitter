@@ -1,0 +1,107 @@
+@echo off
+setlocal enabledelayedexpansion
+
+echo ========================================
+echo    BT Bill Comparison Tool
+echo ========================================
+echo.
+
+:: Set paths
+set SCRIPT_DIR=%~dp0
+set INPUT_OLD=%SCRIPT_DIR%input\old_bills
+set INPUT_NEW=%SCRIPT_DIR%input\new_bills  
+set OUTPUT_DIR=%SCRIPT_DIR%output
+set LOG_FILE=%SCRIPT_DIR%comparison.log
+
+:: Create directories if they don't exist
+if not exist "%INPUT_OLD%" mkdir "%INPUT_OLD%"
+if not exist "%INPUT_NEW%" mkdir "%INPUT_NEW%"
+if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
+
+echo Checking Python installation...
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Python is not installed or not in PATH
+    echo Please install Python 3.7+ from https://python.org
+    pause
+    exit /b 1
+)
+
+echo Checking dependencies...
+pip install -r requirements.txt >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Failed to install dependencies
+    echo Please check requirements.txt and internet connection
+    pause
+    exit /b 1
+)
+
+echo.
+echo Input directories:
+echo - Old bills: %INPUT_OLD%
+echo - New bills: %INPUT_NEW%
+echo.
+echo Output directory: %OUTPUT_DIR%
+echo.
+
+:: Count PDF files
+set /a OLD_COUNT=0
+set /a NEW_COUNT=0
+
+for %%f in ("%INPUT_OLD%\*.pdf") do set /a OLD_COUNT+=1
+for %%f in ("%INPUT_NEW%\*.pdf") do set /a NEW_COUNT+=1
+
+echo Found %OLD_COUNT% PDFs in old_bills folder
+echo Found %NEW_COUNT% PDFs in new_bills folder
+echo.
+
+if %OLD_COUNT%==0 (
+    echo WARNING: No PDF files found in old_bills folder
+    echo Please place your original bills in: %INPUT_OLD%
+    echo.
+)
+
+if %NEW_COUNT%==0 (
+    echo WARNING: No PDF files found in new_bills folder  
+    echo Please place your new bills in: %INPUT_NEW%
+    echo.
+)
+
+if %OLD_COUNT%==0 if %NEW_COUNT%==0 (
+    pause
+    exit /b 1
+)
+
+echo Starting bill comparison...
+echo Log file: %LOG_FILE%
+echo.
+
+:: Run the comparison
+python bt_comparator.py --dirA "%INPUT_OLD%" --dirB "%INPUT_NEW%" --out "%OUTPUT_DIR%" --log "%LOG_FILE%"
+
+if errorlevel 1 (
+    echo.
+    echo ERROR: Comparison failed. Check log file: %LOG_FILE%
+    pause
+    exit /b 1
+)
+
+echo.
+echo ========================================
+echo    COMPARISON COMPLETED SUCCESSFULLY
+echo ========================================
+echo.
+echo Reports generated in: %OUTPUT_DIR%
+echo.
+
+:: Count generated reports
+set /a REPORT_COUNT=0
+for %%f in ("%OUTPUT_DIR%\*.json") do set /a REPORT_COUNT+=1
+for %%f in ("%OUTPUT_DIR%\*.html") do set /a REPORT_COUNT+=1
+
+echo Generated !REPORT_COUNT! report files
+echo.
+echo Opening output directory...
+start "" "%OUTPUT_DIR%"
+
+pause
